@@ -656,10 +656,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: ConnectionTimeout must be greater than 0")
 	}
 
-	if c.GroupConnect {
-		return fmt.Errorf("config: GroupConnect is not supported")
-	}
-
 	if c.IPTOS > 0 && c.IPTOS > 255 {
 		return fmt.Errorf("config: IPTOS must be lower than 255")
 	}

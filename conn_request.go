@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/datarhei/gosrt/circular"
 	"github.com/datarhei/gosrt/crypto"
 	"github.com/datarhei/gosrt/packet"
 	"github.com/datarhei/gosrt/rand"
@@ -68,6 +69,12 @@ type connRequest struct {
 	crypto          crypto.Crypto
 	passphrase      string
 	rejectionReason RejectionReason
+
+	// bonding group support
+	hasGroup   bool
+	groupId    uint32
+	groupType  GroupType
+	linkWeight uint16
 }
 
 func newConnRequest(ln *listener, p packet.Packet) *connRequest {
@@ -227,6 +234,49 @@ func newConnRequest(ln *listener, p packet.Packet) *connRequest {
 
 				return nil
 			}
+
+			// A link of a bonding group requires the listener to be
+			// configured for group connect.
+			if cif.HasGroup && !ln.config.GroupConnect {
+				cif.HandshakeType = packet.HandshakeType(REJ_GROUP)
+				ln.log("handshake:recv:error", func() string {
+					return "peer wants to connect a bonding group link, but the listener is not configured for group connect"
+				})
+				p.MarshalCIF(cif)
+				ln.log("handshake:send:dump", func() string { return p.Dump() })
+				ln.log("handshake:send:cif", func() string { return cif.String() })
+				ln.send(p)
+
+				return nil
+			}
+
+			if cif.HasGroup {
+				// The group type must be one of the supported types and
+				// the group id must have the group bit set.
+				if cif.SRTGroup.GroupType != GroupTypeBroadcast && cif.SRTGroup.GroupType != GroupTypeBackup {
+					cif.HandshakeType = packet.HandshakeType(REJ_GROUP)
+					ln.log("handshake:recv:error", func() string {
+						return fmt.Sprintf("peer sent an invalid group type (%d)", cif.SRTGroup.GroupType)
+					})
+					p.MarshalCIF(cif)
+					ln.log("handshake:send:dump", func() string { return p.Dump() })
+					ln.log("handshake:send:cif", func() string { return cif.String() })
+					ln.send(p)
+
+					return nil
+				}
+
+				if cif.SRTGroup.GroupId&packet.SRTGROUP_MASK == 0 {
+					cif.HandshakeType = packet.HandshakeType(REJ_ROGUE)
+					ln.log("handshake:recv:error", func() string { return "peer sent an invalid group id" })
+					p.MarshalCIF(cif)
+					ln.log("handshake:send:dump", func() string { return p.Dump() })
+					ln.log("handshake:send:cif", func() string { return cif.String() })
+					ln.send(p)
+
+					return nil
+				}
+			}
 		} else {
 			cif.HandshakeType = packet.HandshakeType(REJ_ROGUE)
 			ln.log("handshake:recv:error", func() string { return fmt.Sprintf("only HSv4 and HSv5 are supported (got HSv%d)", cif.Version) })
@@ -247,6 +297,13 @@ func newConnRequest(ln *listener, p packet.Packet) *connRequest {
 			timestamp:    p.Header().Timestamp,
 			config:       config,
 			handshake:    cif,
+		}
+
+		if cif.HasGroup {
+			req.hasGroup = true
+			req.groupId = cif.SRTGroup.GroupId
+			req.groupType = cif.SRTGroup.GroupType
+			req.linkWeight = cif.SRTGroup.LinkWeight
 		}
 
 		if cif.SRTKM != nil {
@@ -404,6 +461,41 @@ func (req *connRequest) Accept() (Conn, error) {
 		return nil, fmt.Errorf("connection already accepted")
 	}
 
+	// Find or create the mirror group for the peer group.
+	var group *Group
+
+	if req.hasGroup {
+		group = req.ln.groups[req.groupId]
+
+		if group == nil {
+			// The first link of the peer group. Create a mirror group.
+			mirrorConfig := req.config
+			mirrorConfig.GroupConnect = true
+			mirrorConfig.Passphrase = req.passphrase
+
+			var err error
+
+			group, err = NewGroup(req.groupType, mirrorConfig)
+			if err != nil {
+				req.ln.log("handshake:recv:error", func() string { return fmt.Sprintf("could not create mirror group: %s", err) })
+				return nil, fmt.Errorf("could not create mirror group: %w", err)
+			}
+
+			// Align the time base and the initial sequence number of the
+			// mirror group with the group of the caller. The SRT protocol
+			// uses a single initial sequence number for both directions
+			// which is announced by the caller.
+			group.start = req.start
+			group.isn = req.handshake.InitialPacketSequenceNumber
+			group.nextSequenceNumber = group.isn
+			group.recvExpected = group.isn
+
+			group.setPeerId(req.groupId)
+
+			req.ln.groups[req.groupId] = group
+		}
+	}
+
 	// Select the largest TSBPD delay advertised by the caller, but at least 120ms
 	recvTsbpdDelay := uint16(req.config.ReceiverLatency.Milliseconds())
 	sendTsbpdDelay := uint16(req.config.PeerLatency.Milliseconds())
@@ -427,8 +519,9 @@ func (req *connRequest) Accept() (Conn, error) {
 		localAddr = req.ln.addr
 	}
 
-	// Create a new connection
-	conn := newSRTConn(srtConnConfig{
+	var conn *srtConn
+
+	conn = newSRTConn(srtConnConfig{
 		version:                     req.handshake.Version,
 		localAddr:                   localAddr,
 		remoteAddr:                  req.addr,
@@ -442,10 +535,30 @@ func (req *connRequest) Accept() (Conn, error) {
 		initialPacketSequenceNumber: req.handshake.InitialPacketSequenceNumber,
 		crypto:                      req.crypto,
 		keyBaseEncryption:           packet.EvenKeyEncrypted,
+		preserveSequenceNumber:      req.hasGroup,
+		deliverTo:                   groupDeliverHook(group),
+		onResponse:                  groupRespondedHook(group),
+		onACK:                       groupAckedHook(group, &conn),
 		onSend:                      req.ln.send,
-		onShutdown:                  req.ln.handleShutdown,
-		logger:                      req.config.Logger,
+		onShutdown: func(c *srtConn) {
+			req.ln.handleShutdown(c)
+
+			if group != nil {
+				group.linkClosed(c)
+			}
+		},
+		logger: req.config.Logger,
 	})
+
+	if req.hasGroup {
+		// Add the link to the mirror group. On failure the connection is
+		// closed and the error is returned to the caller.
+		if err := group.addLink(conn, req.linkWeight); err != nil {
+			conn.close()
+
+			return nil, err
+		}
+	}
 
 	req.ln.log("connection:new", func() string { return fmt.Sprintf("%#08x (%s)", conn.SocketId(), conn.StreamId()) })
 
@@ -467,6 +580,17 @@ func (req *connRequest) Accept() (Conn, error) {
 		req.handshake.SRTHS.SendTSBPDDelay = sendTsbpdDelay
 	}
 
+	if req.hasGroup {
+		// Respond with the group membership of this link. Each side
+		// announces its own group id.
+		req.handshake.HasGroup = true
+		req.handshake.SRTGroup = &packet.CIFGroupExtension{
+			GroupId:    group.id,
+			GroupType:  group.gt,
+			LinkWeight: req.linkWeight,
+		}
+	}
+
 	p := packet.NewPacket(req.addr)
 	p.Header().IsControlPacket = true
 	p.Header().ControlType = packet.CTRLTYPE_HANDSHAKE
@@ -483,5 +607,44 @@ func (req *connRequest) Accept() (Conn, error) {
 	req.ln.conns[req.socketId] = conn
 	req.ln.connsByPeer[req.peerSocketId] = conn
 
+	if req.hasGroup {
+		return group, nil
+	}
+
 	return conn, nil
+}
+
+// groupDeliverHook returns the deliverTo hook of the group, or nil when there is
+// no group.
+func groupDeliverHook(g *Group) func(packet.Packet) {
+	if g == nil {
+		return nil
+	}
+
+	return g.deliver
+}
+
+// groupRespondedHook returns the onResponse hook of the group, or nil when there
+// is no group.
+func groupRespondedHook(g *Group) func(*srtConn) {
+	if g == nil {
+		return nil
+	}
+
+	return g.linkResponded
+}
+
+// groupAckedHook returns the onACK hook of the group, or nil when there is no
+// group. The connection of the link is not known at the time the hook is
+// created, so it is resolved when the hook is called.
+func groupAckedHook(g *Group, conn **srtConn) func(seq circular.Number) {
+	if g == nil {
+		return nil
+	}
+
+	return func(seq circular.Number) {
+		if *conn != nil {
+			g.linkAcked(*conn, seq)
+		}
+	}
 }

@@ -91,6 +91,38 @@ func (h HandshakeType) String() string {
 		return "WAVEHAND"
 	case HSTYPE_INDUCTION:
 		return "INDUCTION"
+	case 1000:
+		return "REJECT (UNKNOWN)"
+	case 1001:
+		return "REJECT (SYSTEM)"
+	case 1002:
+		return "REJECT (PEER)"
+	case 1003:
+		return "REJECT (RESOURCE)"
+	case 1004:
+		return "REJECT (ROGUE)"
+	case 1005:
+		return "REJECT (BACKLOG)"
+	case 1006:
+		return "REJECT (IPE)"
+	case 1007:
+		return "REJECT (CLOSE)"
+	case 1008:
+		return "REJECT (VERSION)"
+	case 1009:
+		return "REJECT (RDVCOOKIE)"
+	case 1010:
+		return "REJECT (BADSECRET)"
+	case 1011:
+		return "REJECT (UNSECURE)"
+	case 1012:
+		return "REJECT (MESSAGEAPI)"
+	case 1013:
+		return "REJECT (CONGESTION)"
+	case 1014:
+		return "REJECT (FILTER)"
+	case 1015:
+		return "REJECT (GROUP)"
 	}
 
 	return "REJECT (" + strconv.FormatUint(uint64(h), 32) + ")"

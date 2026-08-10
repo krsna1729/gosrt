@@ -126,6 +126,7 @@ type listener struct {
 	backlog     chan packet.Packet
 	conns       map[uint32]*srtConn
 	connsByPeer map[uint32]*srtConn
+	groups      map[uint32]*Group // mirror groups, keyed by the group id of the peer
 	lock        sync.RWMutex
 
 	start time.Time
@@ -223,6 +224,7 @@ func Listen(network, address string, config Config) (Listener, error) {
 
 	ln.conns = make(map[uint32]*srtConn)
 	ln.connsByPeer = make(map[uint32]*srtConn)
+	ln.groups = make(map[uint32]*Group)
 
 	ln.backlog = make(chan packet.Packet, 128)
 
@@ -362,6 +364,55 @@ func (ln *listener) error() error {
 	return ln.doneErr
 }
 
+// maybeAcceptGroupLink accepts the packet if it is a handshake of a link of a
+// bonding group whose mirror group already exists on this side. It returns
+// true when the packet has been consumed.
+func (ln *listener) maybeAcceptGroupLink(p packet.Packet) bool {
+	cif := &packet.CIFHandshake{}
+
+	if err := p.UnmarshalCIF(cif); err != nil {
+		return false
+	}
+
+	if !cif.HasGroup {
+		return false
+	}
+
+	ln.lock.RLock()
+	group, ok := ln.groups[cif.SRTGroup.GroupId]
+	ln.lock.RUnlock()
+
+	if !ok {
+		// This is the first link of the peer group. The request goes to the
+		// backlog where the application decides about it.
+		return false
+	}
+
+	// The mirror group exists, so this is a subsequent link of a group that
+	// has already been accepted. Accept the link automatically using the
+	// passphrase of the first link.
+	go func() {
+		req := newConnRequest(ln, p)
+		if req == nil {
+			return
+		}
+
+		if req.IsEncrypted() {
+			if err := req.SetPassphrase(group.config.Passphrase); err != nil {
+				ln.log("handshake:recv:error", func() string { return fmt.Sprintf("could not decrypt group link: %s", err) })
+				req.Reject(REJ_BADSECRET)
+				return
+			}
+		}
+
+		if _, err := req.Accept(); err != nil {
+			ln.log("handshake:recv:error", func() string { return fmt.Sprintf("could not accept group link: %s", err) })
+		}
+	}()
+
+	return true
+}
+
 func (ln *listener) handleShutdown(c *srtConn) {
 	ln.lock.Lock()
 	delete(ln.conns, c.socketId)
@@ -389,7 +440,16 @@ func (ln *listener) Close() {
 			}
 			conn.close()
 		}
+
+		groups := make([]*Group, 0, len(ln.groups))
+		for _, group := range ln.groups {
+			groups = append(groups, group)
+		}
 		ln.lock.RUnlock()
+
+		for _, group := range groups {
+			group.Close()
+		}
 
 		ln.stopReader()
 
@@ -429,6 +489,10 @@ func (ln *listener) reader(ctx context.Context) {
 
 			if p.Header().DestinationSocketId == 0 {
 				if p.Header().IsControlPacket && p.Header().ControlType == packet.CTRLTYPE_HANDSHAKE {
+					if ln.maybeAcceptGroupLink(p) {
+						break
+					}
+
 					select {
 					case ln.backlog <- p:
 					default:
