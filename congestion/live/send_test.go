@@ -149,3 +149,31 @@ func TestSendFlush(t *testing.T) {
 	require.Exactly(t, 0, send.packetList.Len())
 	require.Exactly(t, 0, send.lossList.Len())
 }
+
+func TestSendPreserveSequenceNumber(t *testing.T) {
+	numbers := []uint32{}
+	send := NewSender(SendConfig{
+		InitialSequenceNumber:  circular.New(42, packet.MAX_SEQUENCENUMBER),
+		PreserveSequenceNumber: true,
+		DropThreshold:          10,
+		OnDeliver: func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	}).(*sender)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for i := range 10 {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		send.Push(p)
+	}
+
+	require.Equal(t, uint32(42), send.nextSequenceNumber.Val())
+
+	send.Tick(10)
+
+	require.Exactly(t, []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, numbers)
+}

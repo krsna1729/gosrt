@@ -420,6 +420,22 @@ func (r *receiver) SetNAKInterval(nakInterval uint64) {
 	r.periodicNAKInterval = nakInterval
 }
 
+func (r *receiver) SetSequenceNumber(sequenceNumber circular.Number) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	r.maxSeenSequenceNumber = sequenceNumber.Dec()
+	r.lastACKSequenceNumber = sequenceNumber.Dec()
+	r.lastDeliveredSequenceNumber = sequenceNumber.Dec()
+
+	r.probeTime = time.Time{}
+	r.nPackets = 0
+
+	// Drop all buffered packets. They are behind the new position and would
+	// be dropped as belated anyway.
+	r.packetList = r.packetList.Init()
+}
+
 func (r *receiver) String(t uint64) string {
 	var b strings.Builder
 

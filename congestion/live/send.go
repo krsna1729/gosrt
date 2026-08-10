@@ -18,13 +18,18 @@ type SendConfig struct {
 	InputBW               int64
 	MinInputBW            int64
 	OverheadBW            int64
-	OnDeliver             func(p packet.Packet)
+	// PreserveSequenceNumber keeps the sequence number of pushed packets and
+	// does not advance the sender's own counter. This is used for links of a
+	// bonding group, where the group assigns the sequence numbers.
+	PreserveSequenceNumber bool
+	OnDeliver              func(p packet.Packet)
 }
 
 // sender implements the Sender interface
 type sender struct {
-	nextSequenceNumber circular.Number
-	dropThreshold      uint64
+	nextSequenceNumber     circular.Number
+	preserveSequenceNumber bool
+	dropThreshold          uint64
 
 	packetList *list.List
 	lossList   *list.List
@@ -60,10 +65,11 @@ type sender struct {
 // NewSender takes a SendConfig and returns a new Sender
 func NewSender(config SendConfig) congestion.Sender {
 	s := &sender{
-		nextSequenceNumber: config.InitialSequenceNumber,
-		dropThreshold:      config.DropThreshold,
-		packetList:         list.New(),
-		lossList:           list.New(),
+		nextSequenceNumber:     config.InitialSequenceNumber,
+		preserveSequenceNumber: config.PreserveSequenceNumber,
+		dropThreshold:          config.DropThreshold,
+		packetList:             list.New(),
+		lossList:               list.New(),
 
 		avgPayloadSize: packet.MAX_PAYLOAD_SIZE, //  5.1.2. SRT's Default LiveCC Algorithm
 		maxBW:          float64(config.MaxBW),
@@ -125,13 +131,16 @@ func (s *sender) Push(p packet.Packet) {
 		return
 	}
 
-	// Give to the packet a sequence number
-	p.Header().PacketSequenceNumber = s.nextSequenceNumber
+	// Give to the packet a sequence number. For links of a bonding group the
+	// sequence number is assigned by the group and must be preserved.
+	if !s.preserveSequenceNumber {
+		p.Header().PacketSequenceNumber = s.nextSequenceNumber
+		s.nextSequenceNumber = s.nextSequenceNumber.Inc()
+	}
+
 	p.Header().PacketPositionFlag = packet.SinglePacket
 	p.Header().OrderFlag = false
 	p.Header().MessageNumber = 1
-
-	s.nextSequenceNumber = s.nextSequenceNumber.Inc()
 
 	pktLen := p.Len()
 

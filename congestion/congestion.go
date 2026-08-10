@@ -53,6 +53,13 @@ type Receiver interface {
 
 	// SetNAKInterval sets the interval between two periodic NAK messages to the sender in microseconds.
 	SetNAKInterval(nakInterval uint64)
+
+	// SetSequenceNumber sets the receiver's position to the given sequence
+	// number. The next expected packet is the given sequence number; packets
+	// with a lower sequence number are dropped. This is used to synchronize a
+	// receiver with the position of a bonding group when a link joins the
+	// group or is activated.
+	SetSequenceNumber(sequenceNumber circular.Number)
 }
 
 // SendStats are collected statistics from a sender

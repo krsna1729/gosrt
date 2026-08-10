@@ -624,3 +624,84 @@ func TestIssue67(t *testing.T) {
 
 	require.Equal(t, []uint32{1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 13, 13}, ackNumbers)
 }
+
+func TestRecvSetSequenceNumber(t *testing.T) {
+	numbers := []uint32{}
+	recv := mockLiveRecv(
+		nil,
+		nil,
+		func(p packet.Packet) {
+			numbers = append(numbers, p.Header().PacketSequenceNumber.Val())
+		},
+	)
+
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	for i := range 10 {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	recv.Tick(10)
+
+	require.Exactly(t, []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, numbers)
+
+	// Sync the receiver forward to sequence number 5. All packets behind this
+	// position must be dropped, the next expected packet is 5.
+	recv.SetSequenceNumber(circular.New(5, packet.MAX_SEQUENCENUMBER))
+
+	require.Equal(t, uint32(4), recv.maxSeenSequenceNumber.Val())
+	require.Equal(t, uint32(4), recv.lastACKSequenceNumber.Val())
+	require.Equal(t, uint32(4), recv.lastDeliveredSequenceNumber.Val())
+
+	// Packets behind the synced position are duplicates.
+	for i := range 5 {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	recv.Tick(10)
+
+	require.Exactly(t, []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, numbers)
+
+	// Packets from the synced position on are delivered.
+	for i := 5; i < 15; i++ {
+		p := packet.NewPacket(addr)
+		p.Header().PacketSequenceNumber = circular.New(uint32(i), packet.MAX_SEQUENCENUMBER)
+		p.Header().PktTsbpdTime = uint64(i + 1)
+
+		recv.Push(p)
+	}
+
+	recv.Tick(20)
+
+	require.Exactly(t, []uint32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}, numbers)
+}
+
+func TestRecvSetSequenceNumberBackwards(t *testing.T) {
+	recv := mockLiveRecv(nil, nil, nil)
+
+	recv.SetSequenceNumber(circular.New(100, packet.MAX_SEQUENCENUMBER))
+
+	require.Equal(t, uint32(99), recv.maxSeenSequenceNumber.Val())
+	require.Equal(t, uint32(99), recv.lastACKSequenceNumber.Val())
+	require.Equal(t, uint32(99), recv.lastDeliveredSequenceNumber.Val())
+
+	// Packet 99 is now belated, packet 100 is expected.
+	addr, _ := net.ResolveIPAddr("ip", "127.0.0.1")
+
+	p := packet.NewPacket(addr)
+	p.Header().PacketSequenceNumber = circular.New(100, packet.MAX_SEQUENCENUMBER)
+	p.Header().PktTsbpdTime = 1
+
+	recv.Push(p)
+	recv.Tick(10)
+
+	require.Equal(t, uint32(100), recv.lastDeliveredSequenceNumber.Val())
+}
