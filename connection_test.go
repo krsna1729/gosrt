@@ -2,10 +2,12 @@ package srt
 
 import (
 	"bytes"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt/circular"
 	"github.com/datarhei/gosrt/packet"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -268,6 +270,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 		counter := 0
 
 		dialer, _ := conn.(*dialer)
+		dialer.conn.onSendLock.Lock()
 		originalOnSend := dialer.conn.onSend
 		dialer.conn.onSend = func(p packet.Packet) {
 			if !p.Header().IsControlPacket {
@@ -282,6 +285,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 
 			originalOnSend(p)
 		}
+		dialer.conn.onSendLock.Unlock()
 
 		for range 5 {
 			n, err := conn.Write([]byte(message))
@@ -564,4 +568,164 @@ func TestStats(t *testing.T) {
 
 	require.Equal(t, uint64(len(message)+44), statsWriter.Accumulated.ByteSent)
 	require.Equal(t, uint64(1), statsWriter.Accumulated.PktSent)
+}
+
+// newHookTestConn builds a connection without any network socket in order to
+// test the internal hooks. The default onSend hook swallows all packets.
+func newHookTestConn(t *testing.T, config srtConnConfig) *srtConn {
+	t.Helper()
+
+	if config.config.PayloadSize == 0 {
+		config.config.PayloadSize = MAX_PAYLOAD_SIZE
+	}
+
+	if config.config.PeerIdleTimeout == 0 {
+		config.config.PeerIdleTimeout = time.Minute
+	}
+
+	if config.logger == nil {
+		config.logger = NewLogger(nil)
+	}
+
+	if config.localAddr == nil {
+		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:7000")
+		require.NoError(t, err)
+		config.localAddr = addr
+	}
+
+	if config.remoteAddr == nil {
+		addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:7001")
+		require.NoError(t, err)
+		config.remoteAddr = addr
+	}
+
+	if config.initialPacketSequenceNumber.Val() == 0 {
+		config.initialPacketSequenceNumber = circular.New(1, packet.MAX_SEQUENCENUMBER)
+	}
+
+	if config.onSend == nil {
+		config.onSend = func(p packet.Packet) {}
+	}
+
+	c := newSRTConn(config)
+
+	t.Cleanup(c.close)
+
+	return c
+}
+
+func TestDeliverToHook(t *testing.T) {
+	delivered := make(chan packet.Packet, 1)
+
+	c := newHookTestConn(t, srtConnConfig{
+		deliverTo: func(p packet.Packet) {
+			delivered <- p
+		},
+	})
+
+	p := packet.NewPacket(nil)
+	p.SetData([]byte("hello"))
+
+	c.deliver(p)
+
+	select {
+	case dp := <-delivered:
+		require.Equal(t, []byte("hello"), dp.Data())
+	case <-time.After(time.Second):
+		t.Fatal("packet was not handed to the deliverTo hook")
+	}
+
+	// The packet must not end up in the read queue
+	select {
+	case <-c.readQueue:
+		t.Fatal("packet ended up in the read queue despite a deliverTo hook")
+	default:
+	}
+}
+
+func TestOnResponseHook(t *testing.T) {
+	responses := make(chan struct{}, 1)
+
+	c := newHookTestConn(t, srtConnConfig{
+		onResponse: func(*srtConn) {
+			responses <- struct{}{}
+		},
+	})
+
+	p := packet.NewPacket(nil)
+	p.Header().IsControlPacket = true
+	p.Header().ControlType = packet.CTRLTYPE_KEEPALIVE
+	p.Header().DestinationSocketId = c.socketId
+
+	c.handlePacket(p)
+
+	select {
+	case <-responses:
+	case <-time.After(time.Second):
+		t.Fatal("onResponse hook was not called on packet reception")
+	}
+}
+
+func TestOnACKHook(t *testing.T) {
+	acks := make(chan circular.Number, 1)
+
+	c := newHookTestConn(t, srtConnConfig{
+		onACK: func(seq circular.Number) {
+			acks <- seq
+		},
+	})
+
+	p := packet.NewPacket(nil)
+	p.Header().IsControlPacket = true
+	p.Header().ControlType = packet.CTRLTYPE_ACK
+
+	cif := packet.CIFACK{
+		LastACKPacketSequenceNumber: circular.New(42, packet.MAX_SEQUENCENUMBER),
+		IsLite:                      true,
+	}
+	p.MarshalCIF(&cif)
+
+	c.handlePacket(p)
+
+	select {
+	case seq := <-acks:
+		require.Equal(t, uint32(42), seq.Val())
+	case <-time.After(time.Second):
+		t.Fatal("onACK hook was not called on packet acknowledgement")
+	}
+}
+
+func TestSyncReceiver(t *testing.T) {
+	delivered := make(chan packet.Packet, 2)
+
+	c := newHookTestConn(t, srtConnConfig{
+		deliverTo: func(p packet.Packet) {
+			delivered <- p
+		},
+	})
+
+	c.syncReceiver(circular.New(100, packet.MAX_SEQUENCENUMBER))
+
+	// A packet behind the sync position must be dropped
+	p := packet.NewPacket(nil)
+	p.Header().PacketSequenceNumber = circular.New(99, packet.MAX_SEQUENCENUMBER)
+	p.Header().MessageNumber = 1
+	p.SetData([]byte("belated"))
+
+	c.handlePacket(p)
+
+	// A packet at the sync position must be delivered
+	p = packet.NewPacket(nil)
+	p.Header().PacketSequenceNumber = circular.New(100, packet.MAX_SEQUENCENUMBER)
+	p.Header().MessageNumber = 1
+	p.SetData([]byte("fresh"))
+
+	c.handlePacket(p)
+
+	select {
+	case dp := <-delivered:
+		require.Equal(t, []byte("fresh"), dp.Data())
+	case <-time.After(time.Second):
+		t.Fatal("packet at the synced position was not delivered")
+	}
 }

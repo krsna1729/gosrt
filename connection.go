@@ -191,7 +191,21 @@ type srtConn struct {
 	readBuffer bytes.Buffer
 
 	onSend     func(p packet.Packet)
+	onSendLock sync.RWMutex // onSend can be replaced while the connection is running (tests)
 	onShutdown func(*srtConn)
+
+	// deliverTo routes delivered data packets to the given function instead of
+	// the connection's read queue. Used by bonding groups to de-duplicate
+	// packets received over multiple links.
+	deliverTo func(packet.Packet)
+
+	// onResponse is called whenever a packet is received from the peer. Used
+	// by backup groups to track the stability of a link.
+	onResponse func(*srtConn)
+
+	// onACK is called with the acknowledged sequence number whenever the peer
+	// acknowledges data. Used by backup groups to trim their send buffer.
+	onACK func(seq circular.Number)
 
 	tick time.Duration
 
@@ -233,8 +247,12 @@ type srtConnConfig struct {
 	initialPacketSequenceNumber circular.Number
 	crypto                      crypto.Crypto
 	keyBaseEncryption           packet.PacketEncryption
+	preserveSequenceNumber      bool
 	onSend                      func(p packet.Packet)
 	onShutdown                  func(*srtConn)
+	deliverTo                   func(packet.Packet)
+	onResponse                  func(*srtConn)
+	onACK                       func(seq circular.Number)
 	logger                      Logger
 }
 
@@ -256,6 +274,9 @@ func newSRTConn(config srtConnConfig) *srtConn {
 		keyBaseEncryption:           config.keyBaseEncryption,
 		onSend:                      config.onSend,
 		onShutdown:                  config.onShutdown,
+		deliverTo:                   config.deliverTo,
+		onResponse:                  config.onResponse,
+		onACK:                       config.onACK,
 		logger:                      config.logger,
 	}
 
@@ -265,6 +286,14 @@ func newSRTConn(config srtConnConfig) *srtConn {
 
 	if c.onShutdown == nil {
 		c.onShutdown = func(*srtConn) {}
+	}
+
+	if c.onResponse == nil {
+		c.onResponse = func(*srtConn) {}
+	}
+
+	if c.onACK == nil {
+		c.onACK = func(seq circular.Number) {}
 	}
 
 	c.nextACKNumber = circular.New(1, packet.MAX_TIMESTAMP)
@@ -319,13 +348,14 @@ func newSRTConn(config srtConnConfig) *srtConn {
 	c.dropThreshold += 20_000
 
 	c.snd = live.NewSender(live.SendConfig{
-		InitialSequenceNumber: c.initialPacketSequenceNumber,
-		DropThreshold:         c.dropThreshold,
-		MaxBW:                 c.config.MaxBW,
-		InputBW:               c.config.InputBW,
-		MinInputBW:            c.config.MinInputBW,
-		OverheadBW:            c.config.OverheadBW,
-		OnDeliver:             c.pop,
+		InitialSequenceNumber:  c.initialPacketSequenceNumber,
+		DropThreshold:          c.dropThreshold,
+		MaxBW:                  c.config.MaxBW,
+		InputBW:                c.config.InputBW,
+		MinInputBW:             c.config.MinInputBW,
+		OverheadBW:             c.config.OverheadBW,
+		PreserveSequenceNumber: config.preserveSequenceNumber,
+		OnDeliver:              c.pop,
 	})
 
 	c.ctx, c.cancelCtx = context.WithCancel(context.Background())
@@ -580,7 +610,11 @@ func (c *srtConn) pop(p packet.Packet) {
 	}
 
 	// Send the packet on the wire
-	c.onSend(p)
+	c.onSendLock.RLock()
+	onSend := c.onSend
+	c.onSendLock.RUnlock()
+
+	onSend(p)
 }
 
 // networkQueueReader reads the packets from the network queue in order to process them.
@@ -618,7 +652,13 @@ func (c *srtConn) writeQueueReader(ctx context.Context) {
 }
 
 // deliver writes the packets to the read queue in order to be consumed by the Read function.
+// If a deliverTo hook is set (bonding group), the packet is handed to the hook instead.
 func (c *srtConn) deliver(p packet.Packet) {
+	if c.deliverTo != nil {
+		c.deliverTo(p)
+		return
+	}
+
 	// Non-blocking write to the read queue
 	select {
 	case <-c.ctx.Done():
@@ -628,6 +668,14 @@ func (c *srtConn) deliver(p packet.Packet) {
 	}
 }
 
+// syncReceiver sets the receive position of the connection to the given sequence
+// number. Packets with a lower sequence number are dropped. This is used when a
+// link joins a bonding group or is activated after a failover so that the
+// per-link receiver continues at the position of the group.
+func (c *srtConn) syncReceiver(seq circular.Number) {
+	c.recv.SetSequenceNumber(seq)
+}
+
 // handlePacket checks the packet header. If it is a control packet it will forwarded to the
 // respective handler. If it is a data packet it will be put into congestion control for
 // receiving. The packet will be decrypted if required.
@@ -635,6 +683,10 @@ func (c *srtConn) handlePacket(p packet.Packet) {
 	if p == nil {
 		return
 	}
+
+	// Just heard from the peer. This is used by backup groups to track the
+	// stability of the link.
+	c.onResponse(c)
 
 	c.peerIdleTimeout.Reset(c.config.PeerIdleTimeout)
 
@@ -790,6 +842,8 @@ func (c *srtConn) handleACK(p packet.Packet) {
 	c.log("control:recv:ACK:cif", func() string { return cif.String() })
 
 	c.snd.ACK(cif.LastACKPacketSequenceNumber)
+
+	c.onACK(cif.LastACKPacketSequenceNumber)
 
 	if !cif.IsLite && !cif.IsSmall {
 		// 4.10.  Round-Trip Time Estimation
