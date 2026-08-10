@@ -656,3 +656,203 @@ func BenchmarkBufferpool(b *testing.B) {
 		pool.Put(p)
 	}
 }
+
+func TestGroupExtension(t *testing.T) {
+	g := CIFGroupExtension{
+		GroupId:    SRTGROUP_MASK | 0xabcd,
+		GroupType:  GroupTypeBroadcast,
+		LinkFlags:  0,
+		LinkWeight: 0,
+	}
+
+	var buf bytes.Buffer
+
+	err := g.Marshal(&buf)
+	require.NoError(t, err)
+
+	data := hex.EncodeToString(buf.Bytes())
+
+	require.Equal(t, "4000abcd01000000", data)
+
+	g2 := CIFGroupExtension{}
+
+	err = g2.Unmarshal(buf.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, g, g2)
+}
+
+func TestGroupExtensionBitLayout(t *testing.T) {
+	g := CIFGroupExtension{
+		GroupId:    SRTGROUP_MASK | 0x010203,
+		GroupType:  GroupTypeBackup,
+		LinkFlags:  0x05,
+		LinkWeight: 0x1234,
+	}
+
+	var buf bytes.Buffer
+
+	err := g.Marshal(&buf)
+	require.NoError(t, err)
+
+	// Group ID: 0x40010203, dataword: type (0x02) << 24 | flags (0x05) << 16 | weight (0x1234)
+	require.Equal(t, "4001020302051234", hex.EncodeToString(buf.Bytes()))
+
+	g2 := CIFGroupExtension{}
+
+	err = g2.Unmarshal(buf.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, g, g2)
+	require.Equal(t, GroupTypeBackup, g2.GroupType)
+	require.Equal(t, uint8(0x05), g2.LinkFlags)
+	require.Equal(t, uint16(0x1234), g2.LinkWeight)
+}
+
+func TestGroupExtensionInvalidLength(t *testing.T) {
+	g := CIFGroupExtension{}
+
+	err := g.Unmarshal(make([]byte, 4))
+	require.Error(t, err)
+}
+
+func TestGroupExtensionString(t *testing.T) {
+	g := CIFGroupExtension{
+		GroupId:    SRTGROUP_MASK | 1,
+		GroupType:  GroupTypeBroadcast,
+		LinkFlags:  0,
+		LinkWeight: 10,
+	}
+
+	s := g.String()
+
+	require.Contains(t, s, "groupType : 1 (broadcast)")
+	require.Contains(t, s, "linkWeight : 10")
+}
+
+func TestGroupTypeString(t *testing.T) {
+	require.Equal(t, "broadcast", GroupTypeBroadcast.String())
+	require.Equal(t, "backup", GroupTypeBackup.String())
+	require.Equal(t, "undefined", GroupTypeUndefined.String())
+	require.Equal(t, "undefined", GroupType(255).String())
+}
+
+func TestHandshakeV5GroupExtension(t *testing.T) {
+	ip := srtnet.IP{}
+	ip.Parse("127.0.0.1")
+
+	cif := &CIFHandshake{
+		IsRequest:                   false,
+		Version:                     5,
+		EncryptionField:             0,
+		ExtensionField:              0,
+		InitialPacketSequenceNumber: circular.New(42, MAX_SEQUENCENUMBER),
+		MaxTransmissionUnitSize:     1500,
+		MaxFlowWindowSize:           100,
+		HandshakeType:               HSTYPE_CONCLUSION,
+		SRTSocketId:                 0x274921,
+		SynCookie:                   0x123456,
+		PeerIP:                      ip,
+		HasGroup:                    true,
+		SRTGroup: &CIFGroupExtension{
+			GroupId:    SRTGROUP_MASK | 1,
+			GroupType:  GroupTypeBroadcast,
+			LinkFlags:  0,
+			LinkWeight: 0,
+		},
+	}
+
+	var buf bytes.Buffer
+
+	err := cif.Marshal(&buf)
+	require.NoError(t, err)
+
+	data := hex.EncodeToString(buf.Bytes())
+
+	require.Equal(t, "00000005000000040000002a000005dc00000064ffffffff00274921001234560100007f000000000000000000000000000800024000000101000000", data)
+
+	cif2 := &CIFHandshake{}
+
+	err = cif2.Unmarshal(buf.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, cif, cif2)
+}
+
+func TestHandshakeV5GroupExtensionWithOtherExtensions(t *testing.T) {
+	ip := srtnet.IP{}
+	ip.Parse("127.0.0.1")
+
+	cif := &CIFHandshake{
+		IsRequest:                   false,
+		Version:                     5,
+		EncryptionField:             0,
+		ExtensionField:              0,
+		InitialPacketSequenceNumber: circular.New(42, MAX_SEQUENCENUMBER),
+		MaxTransmissionUnitSize:     1500,
+		MaxFlowWindowSize:           100,
+		HandshakeType:               HSTYPE_CONCLUSION,
+		SRTSocketId:                 0x274921,
+		SynCookie:                   0x123456,
+		PeerIP:                      ip,
+		HasHS:                       true,
+		HasSID:                      true,
+		HasGroup:                    true,
+		SRTHS: &CIFHandshakeExtension{
+			SRTVersion: 0x010402,
+			SRTFlags: CIFHandshakeExtensionFlags{
+				TSBPDSND:      true,
+				TSBPDRCV:      true,
+				CRYPT:         true,
+				TLPKTDROP:     true,
+				PERIODICNAK:   true,
+				REXMITFLG:     true,
+				STREAM:        false,
+				PACKET_FILTER: false,
+			},
+			RecvTSBPDDelay: 100,
+			SendTSBPDDelay: 100,
+		},
+		StreamId: "/live/stream.foobar",
+		SRTGroup: &CIFGroupExtension{
+			GroupId:    SRTGROUP_MASK | 2,
+			GroupType:  GroupTypeBackup,
+			LinkFlags:  0,
+			LinkWeight: 10,
+		},
+	}
+
+	var buf bytes.Buffer
+
+	err := cif.Marshal(&buf)
+	require.NoError(t, err)
+
+	cif2 := &CIFHandshake{}
+
+	err = cif2.Unmarshal(buf.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, cif, cif2)
+	require.Equal(t, SRTGROUP_MASK|2, cif2.SRTGroup.GroupId)
+	require.Equal(t, GroupTypeBackup, cif2.SRTGroup.GroupType)
+	require.Equal(t, uint16(10), cif2.SRTGroup.LinkWeight)
+}
+
+func TestHandshakeV5GroupExtensionInvalidLength(t *testing.T) {
+	ip := srtnet.IP{}
+	ip.Parse("127.0.0.1")
+
+	// Handshake with a group extension of length 1 word instead of 2.
+	var buf bytes.Buffer
+
+	buf.Write([]byte{
+		0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x04,
+		0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x05, 0xdc,
+		0x00, 0x00, 0x00, 0x64, 0xff, 0xff, 0xff, 0xff,
+		0x00, 0x27, 0x49, 0x21, 0x00, 0x12, 0x34, 0x56,
+		0x01, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x08, 0x00, 0x01, 0x40, 0x00, 0x00, 0x01,
+	})
+
+	cif2 := &CIFHandshake{}
+
+	err := cif2.Unmarshal(buf.Bytes())
+	require.Error(t, err)
+}

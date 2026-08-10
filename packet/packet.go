@@ -142,7 +142,7 @@ const (
 	EXTTYPE_SID        CtrlSubType = 5
 	EXTTYPE_CONGESTION CtrlSubType = 6
 	EXTTYPE_FILTER     CtrlSubType = 7 // unimplemented
-	EXTTYPE_GROUP      CtrlSubType = 8 // unimplemented
+	EXTTYPE_GROUP      CtrlSubType = 8
 )
 
 func (h CtrlSubType) String() string {
@@ -172,6 +172,94 @@ func (h CtrlSubType) String() string {
 
 func (h CtrlSubType) Value() uint16 {
 	return uint16(h)
+}
+
+// SRTGROUP_MASK is set on the socket ID of a bonding group. Socket IDs with
+// this bit set designate a group instead of a single connection.
+const SRTGROUP_MASK uint32 = 1 << 30
+
+// GroupType is the type of a bonding group as exchanged in the Group
+// Membership handshake extension (3.2.1.4. Group Membership Extension).
+type GroupType uint8
+
+const (
+	// GroupTypeUndefined is the zero value of GroupType.
+	GroupTypeUndefined GroupType = 0
+	// GroupTypeBroadcast sends all data over all links of the group.
+	// The receiver de-duplicates packets that arrive on multiple links.
+	GroupTypeBroadcast GroupType = 1
+	// GroupTypeBackup keeps all links but one idle and switches to an
+	// idle link when the active one becomes unstable.
+	GroupTypeBackup GroupType = 2
+)
+
+func (t GroupType) String() string {
+	switch t {
+	case GroupTypeBroadcast:
+		return "broadcast"
+	case GroupTypeBackup:
+		return "backup"
+	}
+
+	return "undefined"
+}
+
+// 3.2.1.4.  Group Membership Extension
+
+// CIFGroupExtension represents the Group Membership handshake extension. It is
+// exchanged as part of the v5 CONCLUSION handshake and declares that the
+// connection is a member of a bonding group. The extension contains the ID of
+// the group (with the SRTGROUP_MASK bit set), the group type, and the weight
+// of the link within the group.
+type CIFGroupExtension struct {
+	GroupId    uint32    // ID of the group, with the SRTGROUP_MASK bit set
+	GroupType  GroupType // type of the bonding group
+	LinkFlags  uint8     // informational link flags, currently always 0
+	LinkWeight uint16    // weight of the link, used to prioritize links in backup groups
+}
+
+func (c CIFGroupExtension) String() string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "--- GroupExt ---\n")
+	fmt.Fprintf(&b, "   groupId : %#08x\n", c.GroupId)
+	fmt.Fprintf(&b, "   groupType : %d (%s)\n", c.GroupType, c.GroupType.String())
+	fmt.Fprintf(&b, "   linkFlags : %#04x\n", c.LinkFlags)
+	fmt.Fprintf(&b, "   linkWeight : %d\n", c.LinkWeight)
+	fmt.Fprintf(&b, "--- /GroupExt ---")
+
+	return b.String()
+}
+
+func (c *CIFGroupExtension) Unmarshal(data []byte) error {
+	if len(data) != 8 {
+		return fmt.Errorf("invalid group extension length of %d bytes", len(data))
+	}
+
+	c.GroupId = binary.BigEndian.Uint32(data[0:])
+
+	dataword := binary.BigEndian.Uint32(data[4:])
+
+	c.GroupType = GroupType(dataword >> 24)
+	c.LinkFlags = uint8(dataword >> 16)
+	c.LinkWeight = uint16(dataword)
+
+	return nil
+}
+
+func (c *CIFGroupExtension) Marshal(w io.Writer) error {
+	if w == nil {
+		return fmt.Errorf("invalid writer")
+	}
+
+	var buffer [8]byte
+
+	binary.BigEndian.PutUint32(buffer[0:], c.GroupId)
+	binary.BigEndian.PutUint32(buffer[4:], (uint32(c.GroupType)<<24)|(uint32(c.LinkFlags)<<16)|uint32(c.LinkWeight))
+
+	w.Write(buffer[:])
+
+	return nil
 }
 
 type Packet interface {
@@ -498,6 +586,7 @@ type CIFHandshake struct {
 	HasKM            bool
 	HasSID           bool
 	HasCongestionCtl bool
+	HasGroup         bool
 
 	// 3.2.1.1.  Handshake Extension Message
 	SRTHS *CIFHandshakeExtension
@@ -510,6 +599,9 @@ type CIFHandshake struct {
 
 	// ??? Congestion Control Extension message (handshake.md #### Congestion controller)
 	CongestionCtl string
+
+	// 3.2.1.4.  Group Membership Extension Message
+	SRTGroup *CIFGroupExtension
 }
 
 func (c CIFHandshake) String() string {
@@ -547,6 +639,10 @@ func (c CIFHandshake) String() string {
 			fmt.Fprintf(&b, "--- CongestionExt ---\n")
 			fmt.Fprintf(&b, "   congestion : %s\n", c.CongestionCtl)
 			fmt.Fprintf(&b, "--- /CongestionExt ---\n")
+		}
+
+		if c.HasGroup {
+			fmt.Fprintf(&b, "%s\n", c.SRTGroup.String())
 		}
 	}
 
@@ -682,7 +778,20 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 			}
 
 			c.CongestionCtl = strings.TrimRight(b.String(), "\x00")
-		} else if extensionType == EXTTYPE_FILTER || extensionType == EXTTYPE_GROUP {
+		} else if extensionType == EXTTYPE_GROUP {
+			// 3.2.1.4.  Group Membership Extension Message
+			if extensionLength != 8 || len(pivot) < extensionLength {
+				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
+			}
+
+			c.HasGroup = true
+
+			c.SRTGroup = &CIFGroupExtension{}
+
+			if err := c.SRTGroup.Unmarshal(pivot); err != nil {
+				return fmt.Errorf("CIFGroupExtension: %w", err)
+			}
+		} else if extensionType == EXTTYPE_FILTER {
 			// Skip unimplemented extensions
 			if len(pivot) < extensionLength {
 				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
@@ -734,6 +843,10 @@ func (c *CIFHandshake) Marshal(w io.Writer) error {
 		}
 
 		if c.HasCongestionCtl {
+			c.ExtensionField = c.ExtensionField | 4
+		}
+
+		if c.HasGroup {
 			c.ExtensionField = c.ExtensionField | 4
 		}
 	} else {
@@ -840,6 +953,18 @@ func (c *CIFHandshake) Marshal(w io.Writer) error {
 
 			w.Write(buffer[:4])
 		}
+	}
+
+	if c.HasGroup {
+		var data bytes.Buffer
+
+		c.SRTGroup.Marshal(&data)
+
+		binary.BigEndian.PutUint16(buffer[0:], EXTTYPE_GROUP.Value())
+		binary.BigEndian.PutUint16(buffer[2:], 2)
+
+		w.Write(buffer[:4])
+		w.Write(data.Bytes())
 	}
 
 	return nil
