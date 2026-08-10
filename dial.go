@@ -35,6 +35,10 @@ type dialer struct {
 	socketId                    uint32
 	initialPacketSequenceNumber circular.Number
 
+	// bonding group support
+	group      *Group
+	linkWeight uint16
+
 	crypto crypto.Crypto
 
 	conn     *srtConn
@@ -73,7 +77,7 @@ type connResponse struct {
 //
 // In case of an error the returned Conn is nil and the error is non-nil.
 func Dial(network, address string, config Config) (Conn, error) {
-	return DialWithContext(context.Background(), network, address, config)
+return DialWithContext(context.Background(), network, address, config)
 }
 
 // DialWithContext connects to the address using the SRT protocol with the given config
@@ -91,6 +95,16 @@ func DialWithContext(ctx context.Context, network, address string, config Config
 		return nil, fmt.Errorf("context must not be nil")
 	}
 
+	return dial(ctx, network, address, config, nil, 0)
+}
+
+// dialGroup connects a link of the given bonding group to the address and
+// registers it with the group.
+func dialGroup(network, address string, config Config, group *Group, weight uint16) (Conn, error) {
+	return dial(context.Background(), network, address, config, group, weight)
+}
+
+func dial(ctx context.Context, network, address string, config Config, group *Group, weight uint16) (Conn, error) {
 	if network != "srt" {
 		return nil, fmt.Errorf("the network must be 'srt'")
 	}
@@ -104,7 +118,9 @@ func DialWithContext(ctx context.Context, network, address string, config Config
 	}
 
 	dl := &dialer{
-		config: config,
+		config:     config,
+		group:      group,
+		linkWeight: weight,
 	}
 
 	netdialer := net.Dialer{
@@ -149,6 +165,13 @@ func DialWithContext(ctx context.Context, network, address string, config Config
 		return nil, err
 	}
 	dl.initialPacketSequenceNumber = circular.New(seqNum&packet.MAX_SEQUENCENUMBER, packet.MAX_SEQUENCENUMBER)
+
+	if dl.group != nil {
+		// All links of a bonding group share the same initial sequence
+		// number and time base.
+		dl.initialPacketSequenceNumber = dl.group.isn
+		dl.start = dl.group.start
+	}
 
 	go func() {
 		buffer := make([]byte, MAX_MSS_SIZE) // MTU size
@@ -232,6 +255,44 @@ func DialWithContext(ctx context.Context, network, address string, config Config
 
 		dl.Close()
 		return nil, fmt.Errorf("connection timeout. server didn't respond")
+	}
+}
+
+// groupDeliver returns the deliverTo hook of the group, or nil when the
+// dialer is not part of a bonding group.
+func (dl *dialer) groupDeliver() func(packet.Packet) {
+	if dl.group == nil {
+		return nil
+	}
+
+	return dl.group.deliver
+}
+
+// groupResponded returns the onResponse hook of the group, or nil when the
+// dialer is not part of a bonding group.
+func (dl *dialer) groupResponded() func(*srtConn) {
+	if dl.group == nil {
+		return nil
+	}
+
+	return dl.group.linkResponded
+}
+
+// groupAcked returns the onACK hook of the group, or nil when the dialer is
+// not part of a bonding group.
+func (dl *dialer) groupAcked() func(seq circular.Number) {
+	if dl.group == nil {
+		return nil
+	}
+
+	return func(seq circular.Number) {
+		dl.connLock.RLock()
+		conn := dl.conn
+		dl.connLock.RUnlock()
+
+		if conn != nil {
+			dl.group.linkAcked(conn, seq)
+		}
 	}
 }
 
@@ -431,6 +492,16 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 					return
 				}
 			}
+
+			if dl.group != nil {
+				// Announce the bonding group membership of this link.
+				cif.HasGroup = true
+				cif.SRTGroup = &packet.CIFGroupExtension{
+					GroupId:    dl.group.id,
+					GroupType:  dl.group.gt,
+					LinkWeight: dl.linkWeight,
+				}
+			}
 		} else {
 			dl.version = 4
 
@@ -533,6 +604,34 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 			}
 		}
 
+		// A link of a bonding group requires the peer to be part of the
+		// same group.
+		if dl.group != nil {
+			if !cif.HasGroup {
+				dl.sendShutdown(cif.SRTSocketId)
+
+				dl.connChan <- connResponse{
+					conn: nil,
+					err:  fmt.Errorf("peer is not part of a bonding group"),
+				}
+
+				return
+			}
+
+			if cif.SRTGroup.GroupId&packet.SRTGROUP_MASK == 0 {
+				dl.sendShutdown(cif.SRTSocketId)
+
+				dl.connChan <- connResponse{
+					conn: nil,
+					err:  fmt.Errorf("peer sent an invalid group id"),
+				}
+
+				return
+			}
+
+			dl.group.setPeerId(cif.SRTGroup.GroupId)
+		}
+
 		// Create a new connection
 		conn := newSRTConn(srtConnConfig{
 			version:                     cif.Version,
@@ -549,12 +648,36 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 			initialPacketSequenceNumber: cif.InitialPacketSequenceNumber,
 			crypto:                      dl.crypto,
 			keyBaseEncryption:           packet.EvenKeyEncrypted,
+			preserveSequenceNumber:      dl.group != nil,
+			deliverTo:                   dl.groupDeliver(),
+			onResponse:                  dl.groupResponded(),
+			onACK:                       dl.groupAcked(),
 			onSend:                      dl.send,
-			onShutdown:                  func(*srtConn) { dl.Close() },
-			logger:                      dl.config.Logger,
+			onShutdown: func(c *srtConn) {
+				if dl.group != nil {
+					dl.group.linkClosed(c)
+				}
+
+				dl.Close()
+			},
+			logger: dl.config.Logger,
 		})
 
 		dl.log("connection:new", func() string { return fmt.Sprintf("%#08x (%s)", conn.SocketId(), conn.StreamId()) })
+
+		if dl.group != nil {
+			if err := dl.group.addLink(conn, dl.linkWeight); err != nil {
+				conn.close()
+				dl.Close()
+
+				dl.connChan <- connResponse{
+					conn: nil,
+					err:  err,
+				}
+
+				return
+			}
+		}
 
 		dl.connChan <- connResponse{
 			conn: conn,
