@@ -138,6 +138,10 @@ type Group struct {
 // links are added with Connect. The group implements the Conn interface and
 // can be used like any other connection.
 func NewGroup(gt GroupType, config Config) (*Group, error) {
+	if gt != GroupTypeBroadcast && gt != GroupTypeBackup {
+		return nil, fmt.Errorf("invalid group type: %d", gt)
+	}
+
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -382,6 +386,16 @@ func (g *Group) recvState() {
 				if len(g.parked) >= 1024 {
 					g.log("group:recv:error", func() string { return "parked packet queue is full, dropping packet" })
 					g.lock.Unlock()
+					p.Decommission()
+					continue
+				}
+
+				if _, exists := g.parked[seq.Val()]; exists {
+					// A duplicate of a packet that is already parked on
+					// this side of the gap. Drop it instead of replacing
+					// the parked packet, which would leak its memory.
+					g.lock.Unlock()
+					g.log("group:recv:drop", func() string { return fmt.Sprintf("dropped duplicate packet %d", seq.Val()) })
 					p.Decommission()
 					continue
 				}

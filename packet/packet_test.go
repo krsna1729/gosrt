@@ -591,6 +591,42 @@ func TestShutdownString(t *testing.T) {
 	require.Greater(t, len(cif.String()), 0)
 }
 
+func TestACKACK(t *testing.T) {
+	cif := &CIFACKACK{}
+
+	var buf bytes.Buffer
+
+	cif.Marshal(&buf)
+
+	data := hex.EncodeToString(buf.Bytes())
+
+	require.Equal(t, "00000000", data)
+
+	// The payload is the mandatory 4-byte zero-filled padding.
+	cif2 := &CIFACKACK{}
+
+	err := cif2.Unmarshal(buf.Bytes())
+
+	require.NoError(t, err)
+
+	// An omitted payload is tolerated as well.
+	err = cif2.Unmarshal(nil)
+
+	require.NoError(t, err)
+
+	// Any other payload length is invalid.
+	err = cif2.Unmarshal(make([]byte, 1))
+
+	require.Error(t, err)
+}
+
+func TestACKACKString(t *testing.T) {
+	cif := &CIFACKACK{}
+
+	require.Greater(t, len(cif.String()), 0)
+	require.Contains(t, cif.String(), "ACKACK")
+}
+
 func BenchmarkNewPacket(b *testing.B) {
 	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:6000")
 

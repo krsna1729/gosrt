@@ -1,9 +1,15 @@
 package srt
 
 import (
+	"bytes"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/datarhei/gosrt/circular"
+	"github.com/datarhei/gosrt/crypto"
+	"github.com/datarhei/gosrt/packet"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -214,4 +220,301 @@ func TestGroupBackupFailoverIntegration(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 	}
 
+}
+
+// TestGroupEncrypted verifies that a bonding group encrypts the data of all
+// its links and that the mirror group decrypts and de-duplicates it.
+func TestGroupEncrypted(t *testing.T) {
+	passphrase := "foobarfoobar"
+	channel := NewPubSub(PubSubConfig{})
+
+	config := DefaultConfig()
+	config.EnforcedEncryption = true
+	config.GroupConnect = true
+
+	server := Server{
+		Addr:   "127.0.0.1:0",
+		Config: &config,
+		HandleConnect: func(req ConnRequest) ConnType {
+			if req.IsEncrypted() {
+				if err := req.SetPassphrase(passphrase); err != nil {
+					return REJECT
+				}
+			}
+
+			switch req.StreamId() {
+			case "publish":
+				return PUBLISH
+			case "subscribe":
+				return SUBSCRIBE
+			}
+
+			return REJECT
+		},
+		HandlePublish: func(conn Conn) {
+			channel.Publish(conn)
+
+			conn.Close()
+		},
+		HandleSubscribe: func(conn Conn) {
+			channel.Subscribe(conn)
+
+			conn.Close()
+		},
+	}
+
+	err := server.Listen()
+	require.NoError(t, err)
+
+	defer server.Shutdown()
+
+	go func() {
+		err := server.Serve()
+		if err == ErrServerClosed {
+			return
+		}
+		require.NoError(t, err)
+	}()
+
+	// A group with the wrong passphrase must not connect.
+	wrong := DefaultConfig()
+	wrong.StreamId = "publish"
+	wrong.Passphrase = "barfoobarfoo"
+
+	bad, err := NewGroup(GroupTypeBackup, wrong)
+	require.NoError(t, err)
+
+	defer bad.Close()
+
+	err = bad.Connect("srt", server.ln.Addr().String(), 1)
+	require.Error(t, err)
+
+	// The encrypted group connects both links and delivers the data. In
+	// broadcast mode the same encrypted packet arrives over both links and
+	// the mirror group must deliver it only once.
+	gconfig := DefaultConfig()
+	gconfig.StreamId = "publish"
+	gconfig.Passphrase = passphrase
+
+	g, err := NewGroup(GroupTypeBroadcast, gconfig)
+	require.NoError(t, err)
+
+	defer g.Close()
+
+	require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 1))
+	require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 2))
+
+	readerConnected := make(chan struct{})
+	received := make(chan string, 16)
+
+	go func() {
+		config := DefaultConfig()
+		config.StreamId = "subscribe"
+		config.Passphrase = passphrase
+
+		conn, err := Dial("srt", server.ln.Addr().String(), config)
+		if !assert.NoError(t, err) {
+			panic(err.Error())
+		}
+
+		close(readerConnected)
+
+		buffer := make([]byte, 2048)
+
+		for {
+			n, err := conn.Read(buffer)
+			if n != 0 {
+				received <- string(buffer[:n])
+			}
+
+			if err != nil {
+				break
+			}
+		}
+
+		conn.Close()
+	}()
+
+	<-readerConnected
+
+	message := "Hello Group!"
+
+	_, err = g.Write([]byte(message))
+	require.NoError(t, err)
+
+	select {
+	case data := <-received:
+		require.Equal(t, message, data)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the encrypted message")
+	}
+
+	g.Close()
+
+	// Wait for the subscriber connection to wind down.
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+	}
+}
+
+// TestGroupAutoAcceptWrongPassphrase sends a forged second link of an already
+// accepted group with a wrong passphrase. The listener must reject it with
+// REJ_BADSECRET and must not touch the mirror group.
+func TestGroupAutoAcceptWrongPassphrase(t *testing.T) {
+	passphrase := "correctsecret"
+
+	config := DefaultConfig()
+	config.EnforcedEncryption = true
+	config.GroupConnect = true
+
+	ln, err := Listen("srt", "127.0.0.1:0", config)
+	require.NoError(t, err)
+
+	defer ln.Close()
+
+	groups := make(chan Conn, 1)
+
+	go func() {
+		for {
+			req, err := ln.Accept2()
+			if err != nil {
+				return
+			}
+
+			if req.IsEncrypted() {
+				if err := req.SetPassphrase(passphrase); err != nil {
+					req.Reject(REJ_BADSECRET)
+					continue
+				}
+			}
+
+			conn, err := req.Accept()
+			if err != nil {
+				continue
+			}
+
+			select {
+			case groups <- conn:
+			default:
+			}
+		}
+	}()
+
+	// Connect the first link with the correct passphrase. The listener
+	// creates the mirror group for it.
+	gconfig := DefaultConfig()
+	gconfig.Passphrase = passphrase
+
+	g, err := NewGroup(GroupTypeBackup, gconfig)
+	require.NoError(t, err)
+
+	defer g.Close()
+
+	require.NoError(t, g.Connect("srt", ln.Addr().String(), 1))
+
+	mirror := <-groups
+
+	groupID := mirror.PeerSocketId()
+	require.NotZero(t, groupID&packet.SRTGROUP_MASK)
+
+	// Send handshakes from a raw UDP socket and return the parsed response.
+	ua, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	defer ua.Close()
+
+	write := func(cif *packet.CIFHandshake) *packet.CIFHandshake {
+		p := packet.NewPacket(ua.LocalAddr())
+		p.Header().IsControlPacket = true
+		p.Header().ControlType = packet.CTRLTYPE_HANDSHAKE
+		p.Header().DestinationSocketId = 0
+
+		require.NoError(t, p.MarshalCIF(cif))
+
+		var buf bytes.Buffer
+
+		require.NoError(t, p.Marshal(&buf))
+
+		_, err := ua.WriteTo(buf.Bytes(), ln.Addr())
+		require.NoError(t, err)
+
+		ua.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+		raw := make([]byte, 2048)
+
+		n, err := ua.Read(raw)
+		require.NoError(t, err)
+
+		rp, err := packet.NewPacketFromData(ua.LocalAddr(), raw[:n])
+		require.NoError(t, err)
+
+		rcif := &packet.CIFHandshake{}
+
+		require.NoError(t, rp.UnmarshalCIF(rcif))
+
+		return rcif
+	}
+
+	// Induction. The listener answers with a SYN cookie.
+	rcif := write(&packet.CIFHandshake{
+		Version:       5,
+		HandshakeType: packet.HSTYPE_INDUCTION,
+		SRTSocketId:   0x12345678,
+	})
+
+	require.NotZero(t, rcif.SynCookie)
+
+	// Conclusion of the forged second link: the same group id as the
+	// accepted group, but a key material derived from a wrong passphrase.
+	km := &packet.CIFKeyMaterialExtension{}
+
+	cr, err := crypto.New(16)
+	require.NoError(t, err)
+
+	require.NoError(t, cr.MarshalKM(km, "wrongsecret", packet.EvenKeyEncrypted))
+
+	rcif = write(&packet.CIFHandshake{
+		Version:                     5,
+		HandshakeType:               packet.HSTYPE_CONCLUSION,
+		InitialPacketSequenceNumber: circular.New(1, packet.MAX_SEQUENCENUMBER),
+		MaxTransmissionUnitSize:     1500,
+		MaxFlowWindowSize:           8192,
+		SRTSocketId:                 0x12345678,
+		SynCookie:                   rcif.SynCookie,
+		HasHS:                       true,
+		SRTHS: &packet.CIFHandshakeExtension{
+			SRTVersion: SRT_VERSION,
+			SRTFlags: packet.CIFHandshakeExtensionFlags{
+				TSBPDSND:    true,
+				TSBPDRCV:    true,
+				TLPKTDROP:   true,
+				PERIODICNAK: true,
+				REXMITFLG:   true,
+			},
+			RecvTSBPDDelay: 120,
+			SendTSBPDDelay: 120,
+		},
+		HasGroup: true,
+		SRTGroup: &packet.CIFGroupExtension{
+			GroupId:    groupID,
+			GroupType:  GroupTypeBackup,
+			LinkWeight: 1,
+		},
+		HasKM: true,
+		SRTKM: km,
+	})
+
+	require.Equal(t, packet.HandshakeType(REJ_BADSECRET), rcif.HandshakeType)
+
+	// The mirror group must not have gained a link.
+	mirrorGroup, ok := mirror.(*Group)
+	require.True(t, ok)
+
+	require.Eventually(t, func() bool {
+		mirrorGroup.lock.RLock()
+		defer mirrorGroup.lock.RUnlock()
+
+		return len(mirrorGroup.links) == 1
+	}, time.Second, 10*time.Millisecond)
 }
