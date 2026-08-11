@@ -1531,6 +1531,38 @@ func (c *CIFNAK) Marshal(w io.Writer) error {
 	return nil
 }
 
+//  3.2.6. Acknowledgement of Acknowledgement (ACKACK)
+
+// CIFACKACK represents the acknowledgement of an acknowledgement. The ACK
+// sequence number is carried in the type-specific field of the control
+// header. The payload is the 4-byte zero-filled padding required for all
+// control packets without arguments.
+type CIFACKACK struct{}
+
+func (c CIFACKACK) String() string {
+	return "--- ACKACK ---"
+}
+
+func (c *CIFACKACK) Unmarshal(data []byte) error {
+	if len(data) != 0 && len(data) != 4 {
+		return fmt.Errorf("invalid length")
+	}
+
+	return nil
+}
+
+func (c *CIFACKACK) Marshal(w io.Writer) error {
+	if w == nil {
+		return fmt.Errorf("invalid writer")
+	}
+
+	var buffer [4]byte
+
+	_, err := w.Write(buffer[0:])
+
+	return err
+}
+
 //  3.2.7. Shutdown
 
 // CIFShutdown represents a shutdown message.

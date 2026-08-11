@@ -366,6 +366,44 @@ func (ln *listener) error() error {
 
 // maybeAcceptGroupLink accepts the packet if it is a handshake of a link of a
 // bonding group whose mirror group already exists on this side. It returns
+// respondToInduction answers a caller's induction request with the SYN cookie,
+// as required by the handshake protocol (4.3.1. Caller-Listener Handshake).
+// It returns true when the packet was an induction and has been consumed.
+func (ln *listener) respondToInduction(p packet.Packet) bool {
+	cif := &packet.CIFHandshake{}
+
+	if err := p.UnmarshalCIF(cif); err != nil {
+		return false
+	}
+
+	if cif.HandshakeType != packet.HSTYPE_INDUCTION {
+		return false
+	}
+
+	ln.log("handshake:recv:cif", func() string { return cif.String() })
+
+	p.Header().ControlType = packet.CTRLTYPE_HANDSHAKE
+	p.Header().SubType = 0
+	p.Header().TypeSpecific = 0
+	p.Header().Timestamp = uint32(time.Since(ln.start).Microseconds())
+	p.Header().DestinationSocketId = cif.SRTSocketId
+
+	cif.PeerIP.FromNetAddr(ln.addr)
+	cif.Version = 5
+	cif.EncryptionField = 0 // Don't advertise any specific encryption method
+	cif.ExtensionField = 0x4A17
+	cif.SynCookie = ln.syncookie.Get(p.Header().Addr.String())
+
+	p.MarshalCIF(cif)
+
+	ln.log("handshake:send:dump", func() string { return p.Dump() })
+	ln.log("handshake:send:cif", func() string { return cif.String() })
+
+	ln.send(p)
+
+	return true
+}
+
 // true when the packet has been consumed.
 func (ln *listener) maybeAcceptGroupLink(p packet.Packet) bool {
 	cif := &packet.CIFHandshake{}
@@ -490,6 +528,18 @@ func (ln *listener) reader(ctx context.Context) {
 			if p.Header().DestinationSocketId == 0 {
 				if p.Header().IsControlPacket && p.Header().ControlType == packet.CTRLTYPE_HANDSHAKE {
 					if ln.maybeAcceptGroupLink(p) {
+						break
+					}
+
+					// The handshake protocol requires the listener to answer
+					// an induction immediately with a SYN cookie so that the
+					// caller can proceed to the conclusion. Doing this only
+					// when the application calls Accept2() would stall group
+					// links whose mirror group already exists: the
+					// application is not waiting for new requests anymore,
+					// so the induction would never be answered. The
+					// conclusion is then routed via maybeAcceptGroupLink.
+					if ln.respondToInduction(p) {
 						break
 					}
 

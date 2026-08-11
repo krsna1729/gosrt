@@ -1328,6 +1328,8 @@ func (c *srtConn) sendACKACK(ackSequence uint32) {
 
 	p.Header().TypeSpecific = ackSequence
 
+	p.MarshalCIF(&packet.CIFACKACK{})
+
 	c.log("control:send:ACKACK:dump", func() string { return p.Dump() })
 
 	c.statisticsLock.Lock()
