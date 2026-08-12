@@ -735,9 +735,15 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 
 		pivot = pivot[4:]
 
+		if len(pivot) < extensionLength {
+			return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
+		}
+
+		value := pivot[:extensionLength]
+
 		if extensionType == EXTTYPE_HSREQ || extensionType == EXTTYPE_HSRSP {
 			// 3.2.1.1.  Handshake Extension Message
-			if extensionLength != 12 || len(pivot) < extensionLength {
+			if extensionLength != 12 {
 				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
 			}
 
@@ -745,20 +751,16 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 
 			c.SRTHS = &CIFHandshakeExtension{}
 
-			if err := c.SRTHS.Unmarshal(pivot); err != nil {
+			if err := c.SRTHS.Unmarshal(value); err != nil {
 				return fmt.Errorf("CIFHandshakeExtension: %w", err)
 			}
 		} else if extensionType == EXTTYPE_KMREQ || extensionType == EXTTYPE_KMRSP {
 			// 3.2.1.2.  Key Material Extension Message
-			if len(pivot) < extensionLength {
-				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
-			}
-
 			c.HasKM = true
 
 			c.SRTKM = &CIFKeyMaterialExtension{}
 
-			if err := c.SRTKM.Unmarshal(pivot); err != nil {
+			if err := c.SRTKM.Unmarshal(value); err != nil {
 				return fmt.Errorf("CIFKeyMaterialExtension: %w", err)
 			}
 
@@ -776,7 +778,7 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 			}
 		} else if extensionType == EXTTYPE_SID {
 			// 3.2.1.3.  Stream ID Extension Message
-			if extensionLength > 512 || len(pivot) < extensionLength {
+			if extensionLength > 512 {
 				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
 			}
 
@@ -785,16 +787,16 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 			var b strings.Builder
 
 			for i := 0; i < extensionLength; i += 4 {
-				b.WriteByte(pivot[i+3])
-				b.WriteByte(pivot[i+2])
-				b.WriteByte(pivot[i+1])
-				b.WriteByte(pivot[i+0])
+				b.WriteByte(value[i+3])
+				b.WriteByte(value[i+2])
+				b.WriteByte(value[i+1])
+				b.WriteByte(value[i+0])
 			}
 
 			c.StreamId = strings.TrimRight(b.String(), "\x00")
 		} else if extensionType == EXTTYPE_CONGESTION {
 			// ??? Congestion Control Extension message (handshake.md #### Congestion controller)
-			if extensionLength > 4 || len(pivot) < extensionLength {
+			if extensionLength > 4 {
 				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
 			}
 
@@ -803,16 +805,16 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 			var b strings.Builder
 
 			for i := 0; i < extensionLength; i += 4 {
-				b.WriteByte(pivot[i+3])
-				b.WriteByte(pivot[i+2])
-				b.WriteByte(pivot[i+1])
-				b.WriteByte(pivot[i+0])
+				b.WriteByte(value[i+3])
+				b.WriteByte(value[i+2])
+				b.WriteByte(value[i+1])
+				b.WriteByte(value[i+0])
 			}
 
 			c.CongestionCtl = strings.TrimRight(b.String(), "\x00")
 		} else if extensionType == EXTTYPE_GROUP {
 			// 3.2.1.4.  Group Membership Extension Message
-			if extensionLength != 8 || len(pivot) < extensionLength {
+			if extensionLength != 8 {
 				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
 			}
 
@@ -820,19 +822,13 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 
 			c.SRTGroup = &CIFGroupExtension{}
 
-			if err := c.SRTGroup.Unmarshal(pivot); err != nil {
+			if err := c.SRTGroup.Unmarshal(value); err != nil {
 				return fmt.Errorf("CIFGroupExtension: %w", err)
 			}
 		} else if extensionType == EXTTYPE_FILTER {
 			// Skip unimplemented extensions
-			if len(pivot) < extensionLength {
-				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
-			}
 		} else {
 			// Skip unknown extensions
-			if len(pivot) < extensionLength {
-				return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())
-			}
 		}
 
 		if len(pivot) > extensionLength {

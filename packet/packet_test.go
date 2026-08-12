@@ -870,6 +870,127 @@ func TestHandshakeV5GroupExtensionWithOtherExtensions(t *testing.T) {
 	require.Equal(t, uint16(10), cif2.SRTGroup.LinkWeight)
 }
 
+func TestHandshakeV5GroupExtensionWithKM(t *testing.T) {
+	ip := srtnet.IP{}
+	ip.Parse("127.0.0.1")
+
+	cif := &CIFHandshake{
+		IsRequest:                   false,
+		Version:                     5,
+		EncryptionField:             0,
+		ExtensionField:              0,
+		InitialPacketSequenceNumber: circular.New(42, MAX_SEQUENCENUMBER),
+		MaxTransmissionUnitSize:     1500,
+		MaxFlowWindowSize:           100,
+		HandshakeType:               HSTYPE_CONCLUSION,
+		SRTSocketId:                 0x274921,
+		SynCookie:                   0x123456,
+		PeerIP:                      ip,
+		HasHS:                       true,
+		HasKM:                       true,
+		HasGroup:                    true,
+		SRTHS: &CIFHandshakeExtension{
+			SRTVersion: 0x010402,
+			SRTFlags: CIFHandshakeExtensionFlags{
+				TSBPDSND:      true,
+				TSBPDRCV:      true,
+				CRYPT:         true,
+				TLPKTDROP:     true,
+				PERIODICNAK:   true,
+				REXMITFLG:     true,
+				STREAM:        false,
+				PACKET_FILTER: false,
+			},
+			RecvTSBPDDelay: 100,
+			SendTSBPDDelay: 100,
+		},
+		SRTKM: &CIFKeyMaterialExtension{
+			S:                     0,
+			Version:               1,
+			PacketType:            2,
+			Sign:                  0x2029,
+			KeyBasedEncryption:    2,
+			KeyEncryptionKeyIndex: 0,
+			Cipher:                2,
+			StreamEncapsulation:   2,
+			SLen:                  16,
+			KLen:                  16,
+			Salt:                  []byte{0x1a, 0x19, 0xd9, 0x46, 0x0f, 0x83, 0xea, 0xbe, 0x0d, 0xc2, 0x9a, 0x87, 0x3a, 0x25, 0x31, 0x7c},
+			Wrap:                  []byte{0xc7, 0x83, 0x30, 0x3b, 0x6c, 0x51, 0xf2, 0xa9, 0x5b, 0x0b, 0xc4, 0xf3, 0xda, 0x56, 0x05, 0x28, 0xa5, 0xe5, 0x82, 0x55, 0x5a, 0xbc, 0x40, 0xc1},
+		},
+		SRTGroup: &CIFGroupExtension{
+			GroupId:    SRTGROUP_MASK | 2,
+			GroupType:  GroupTypeBroadcast,
+			LinkFlags:  0,
+			LinkWeight: 10,
+		},
+	}
+
+	var buf bytes.Buffer
+
+	err := cif.Marshal(&buf)
+	require.NoError(t, err)
+
+	cif2 := &CIFHandshake{}
+
+	err = cif2.Unmarshal(buf.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, cif, cif2)
+	require.Equal(t, SRTGROUP_MASK|2, cif2.SRTGroup.GroupId)
+	require.Equal(t, GroupTypeBroadcast, cif2.SRTGroup.GroupType)
+	require.Equal(t, uint16(10), cif2.SRTGroup.LinkWeight)
+	require.Equal(t, uint16(16), cif2.SRTKM.KLen)
+	require.Equal(t, uint16(2), cif2.EncryptionField)
+}
+
+// TestHandshakeV5EncryptedGroupLibsrtOrder parses a CONCLUSION exactly as sent
+// by libsrt 1.5.6 (release tag v1.5.6) when both a bonding group and
+// encryption are active. libsrt emits the extensions in the order HSREQ,
+// GROUP, KMREQ, i.e. the group extension is NOT the last one. Earlier parser
+// versions passed the whole remaining buffer to CIFGroupExtension.Unmarshal,
+// which demands exactly 8 bytes, so any extension after GROUP made the
+// handshake fail with "invalid group extension length of 68 bytes" and the
+// connection was never established.
+func TestHandshakeV5EncryptedGroupLibsrtOrder(t *testing.T) {
+	captured := []byte{
+		0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x07,
+		0x3a, 0xd0, 0xbd, 0x78, 0x00, 0x00, 0x05, 0xdc,
+		0x00, 0x00, 0x20, 0x00, 0xff, 0xff, 0xff, 0xff,
+		0x15, 0x71, 0x6c, 0x25, 0xb2, 0x61, 0xa7, 0x71,
+		0x01, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		// HSREQ
+		0x00, 0x01, 0x00, 0x03, 0x00, 0x01, 0x05, 0x06,
+		0x00, 0x00, 0x00, 0xbf, 0x00, 0x78, 0x00, 0x00,
+		// GROUP (libsrt emits it before KMREQ)
+		0x00, 0x08, 0x00, 0x02, 0x55, 0x71, 0x6c, 0x26,
+		0x01, 0x00, 0x00, 0x00,
+		// KMREQ
+		0x00, 0x03, 0x00, 0x0e, 0x12, 0x20, 0x29, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00,
+		0x00, 0x00, 0x04, 0x04, 0x1a, 0x19, 0xd9, 0x46,
+		0x0f, 0x83, 0xea, 0xbe, 0x0d, 0xc2, 0x9a, 0x87,
+		0x3a, 0x25, 0x31, 0x7c, 0xc7, 0x83, 0x30, 0x3b,
+		0x6c, 0x51, 0xf2, 0xa9, 0x5b, 0x0b, 0xc4, 0xf3,
+		0xda, 0x56, 0x05, 0x28, 0xa5, 0xe5, 0x82, 0x55,
+		0x5a, 0xbc, 0x40, 0xc1,
+	}
+
+	cif := &CIFHandshake{}
+
+	err := cif.Unmarshal(captured)
+	require.NoError(t, err)
+	require.True(t, cif.HasGroup)
+	require.Equal(t, uint32(0x55716c26), cif.SRTGroup.GroupId)
+	require.Equal(t, GroupTypeBroadcast, cif.SRTGroup.GroupType)
+	require.True(t, cif.HasKM)
+	require.Equal(t, uint16(16), cif.SRTKM.KLen)
+	require.Equal(t, uint16(16), cif.SRTKM.SLen)
+	require.Equal(t, uint16(2), cif.EncryptionField)
+	require.True(t, cif.HasHS)
+	require.Equal(t, uint32(0x010506), cif.SRTHS.SRTVersion)
+}
+
 func TestHandshakeV5GroupExtensionInvalidLength(t *testing.T) {
 	ip := srtnet.IP{}
 	ip.Parse("127.0.0.1")
