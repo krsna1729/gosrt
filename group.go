@@ -118,7 +118,8 @@ type Group struct {
 	// send buffer, only used by backup groups
 	buffer []packet.Packet
 
-	links []*groupLink
+	links       []*groupLink
+	linksByConn map[*srtConn]*groupLink // O(1) lookup for the per-packet hooks
 
 	shutdownOnce sync.Once
 	closed       bool
@@ -172,6 +173,7 @@ func NewGroup(gt GroupType, config Config) (*Group, error) {
 		recvQueue:          make(chan packet.Packet, 2048),
 		readQueue:          make(chan packet.Packet, 1024),
 		parked:             make(map[uint32]packet.Packet),
+		linksByConn:        make(map[*srtConn]*groupLink),
 		logger:             config.Logger,
 	}
 
@@ -232,22 +234,22 @@ func (g *Group) deliver(p packet.Packet) {
 
 // linkByConn returns the link with the given connection.
 func (g *Group) linkByConn(c *srtConn) *groupLink {
-	for _, l := range g.links {
-		if l.conn == c {
-			return l
-		}
-	}
-
-	return nil
+	return g.linksByConn[c]
 }
 
 // linkResponded is the onResponse hook of the links. It is called on every
-// packet reception and is used to track the stability of the link.
+// packet reception and is used to track the stability of the link. Broadcast
+// groups do not track stability (the backup state machine is not running), so
+// the hook is a no-op for them.
 func (g *Group) linkResponded(c *srtConn) {
+	if g.gt == GroupTypeBroadcast {
+		return
+	}
+
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
-	l := g.linkByConn(c)
+	l := g.linksByConn[c]
 	if l == nil || l.closed {
 		return
 	}
@@ -263,12 +265,17 @@ func (g *Group) linkResponded(c *srtConn) {
 
 // linkAcked is the onACK hook of the links. It is called with the sequence
 // number up to which the peer has acknowledged data and is used to trim the
-// send buffer.
+// send buffer of backup groups. Broadcast groups have no send buffer, so the
+// hook is a no-op for them.
 func (g *Group) linkAcked(c *srtConn, seq circular.Number) {
+	if g.gt == GroupTypeBroadcast {
+		return
+	}
+
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
-	l := g.linkByConn(c)
+	l := g.linksByConn[c]
 	if l == nil || l.closed {
 		return
 	}
@@ -276,9 +283,7 @@ func (g *Group) linkAcked(c *srtConn, seq circular.Number) {
 	if l.acked.Lt(seq) {
 		l.acked = seq
 
-		if g.gt == GroupTypeBackup {
-			g.trimBufferLocked()
-		}
+		g.trimBufferLocked()
 	}
 }
 
@@ -325,6 +330,7 @@ func (g *Group) addLink(conn *srtConn, weight uint16) error {
 	}
 
 	g.links = append(g.links, l)
+	g.linksByConn[conn] = l
 
 	g.log("group:link", func() string { return fmt.Sprintf("added link %s (weight %d)", conn.RemoteAddr(), weight) })
 
@@ -348,10 +354,12 @@ func (g *Group) linkClosed(c *srtConn) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
 
-	l := g.linkByConn(c)
+	l := g.linksByConn[c]
 	if l == nil || l.closed {
 		return
 	}
+
+	delete(g.linksByConn, c)
 
 	l.closed = true
 	l.state = GroupLinkBroken
