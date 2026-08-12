@@ -2,7 +2,9 @@ package srt
 
 import (
 	"bytes"
-	"context"
+"context"
+	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -637,4 +639,242 @@ func TestDialV5MissingExtension(t *testing.T) {
 
 	_, err = Dial("srt", "127.0.0.1:6003", DefaultConfig())
 	require.EqualError(t, err, "missing handshake extension")
+}
+
+// fakeSRTServer runs a minimal SRT v5 listener peer on 127.0.0.1:6003: it
+// answers the induction with a valid response and answers the conclusion
+// request with the bytes returned by answer. Any error encountered by the
+// server is sent to the returned channel.
+func fakeSRTServer(t *testing.T, answer func(p packet.Packet, cif *packet.CIFHandshake) []byte) <-chan error {
+	t.Helper()
+
+	ln, err := net.ListenPacket("udp", "127.0.0.1:6003")
+	require.NoError(t, err)
+
+	serverDone := make(chan error, 1)
+
+	go func() {
+		defer ln.Close()
+
+		buf := make([]byte, MAX_MSS_SIZE)
+
+		// Receive the induction request.
+		n, addr, err := ln.ReadFrom(buf)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		p, err := packet.NewPacketFromData(addr, buf[:n])
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		recvcif := &packet.CIFHandshake{}
+		if err = p.UnmarshalCIF(recvcif); err != nil {
+			serverDone <- err
+			return
+		}
+
+		if recvcif.HandshakeType != packet.HSTYPE_INDUCTION {
+			serverDone <- fmt.Errorf("expected induction request, got %s", recvcif.HandshakeType)
+			return
+		}
+
+		// Answer with a valid induction response.
+		p.Header().IsControlPacket = true
+		p.Header().ControlType = packet.CTRLTYPE_HANDSHAKE
+		p.Header().SubType = 0
+		p.Header().TypeSpecific = 0
+		p.Header().Timestamp = 0
+		p.Header().DestinationSocketId = recvcif.SRTSocketId
+
+		inductionResp := &packet.CIFHandshake{
+			IsRequest:                   false,
+			Version:                     5,
+			EncryptionField:             0,
+			ExtensionField:              0x4A17,
+			InitialPacketSequenceNumber: recvcif.InitialPacketSequenceNumber,
+			MaxTransmissionUnitSize:     recvcif.MaxTransmissionUnitSize,
+			MaxFlowWindowSize:           recvcif.MaxFlowWindowSize,
+			HandshakeType:               packet.HSTYPE_INDUCTION,
+			SRTSocketId:                 recvcif.SRTSocketId,
+			SynCookie:                   1234,
+		}
+		inductionResp.PeerIP.FromNetAddr(ln.LocalAddr())
+		p.MarshalCIF(inductionResp)
+
+		var outbuf bytes.Buffer
+
+		if err = p.Marshal(&outbuf); err != nil {
+			serverDone <- err
+			return
+		}
+
+		if _, err = ln.WriteTo(outbuf.Bytes(), addr); err != nil {
+			serverDone <- err
+			return
+		}
+
+		// Receive the conclusion request.
+		n, addr, err = ln.ReadFrom(buf)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		p, err = packet.NewPacketFromData(addr, buf[:n])
+		if err != nil {
+			serverDone <- err
+			return
+		}
+
+		recvcif = &packet.CIFHandshake{}
+		if err = p.UnmarshalCIF(recvcif); err != nil {
+			serverDone <- err
+			return
+		}
+
+		if recvcif.HandshakeType != packet.HSTYPE_CONCLUSION {
+			serverDone <- fmt.Errorf("expected conclusion request, got %s", recvcif.HandshakeType)
+			return
+		}
+
+		// Answer the conclusion with the bytes from the caller.
+		if _, err = ln.WriteTo(answer(p, recvcif), addr); err != nil {
+			serverDone <- err
+			return
+		}
+
+		serverDone <- nil
+	}()
+
+	return serverDone
+}
+
+// conclusionResponse marshals a valid v5 conclusion response to the request
+// in p, optionally carrying the given group extension.
+func conclusionResponse(t *testing.T, p packet.Packet, recvcif *packet.CIFHandshake, group *packet.CIFGroupExtension) []byte {
+	t.Helper()
+
+	p.Header().IsControlPacket = true
+	p.Header().ControlType = packet.CTRLTYPE_HANDSHAKE
+	p.Header().SubType = 0
+	p.Header().TypeSpecific = 0
+	p.Header().Timestamp = 0
+	p.Header().DestinationSocketId = recvcif.SRTSocketId
+
+	conclusionResp := &packet.CIFHandshake{
+		IsRequest:                   false,
+		Version:                     5,
+		EncryptionField:             0,
+		ExtensionField:              1,
+		InitialPacketSequenceNumber: recvcif.InitialPacketSequenceNumber,
+		MaxTransmissionUnitSize:     recvcif.MaxTransmissionUnitSize,
+		MaxFlowWindowSize:           recvcif.MaxFlowWindowSize,
+		HandshakeType:               packet.HSTYPE_CONCLUSION,
+		SRTSocketId:                 9876,
+		SynCookie:                   0,
+		HasHS:                       true,
+		SRTHS: &packet.CIFHandshakeExtension{
+			SRTVersion: SRT_VERSION,
+			SRTFlags: packet.CIFHandshakeExtensionFlags{
+				TSBPDSND:    true,
+				TSBPDRCV:    true,
+				CRYPT:       true,
+				TLPKTDROP:   true,
+				PERIODICNAK: true,
+				REXMITFLG:   true,
+			},
+			RecvTSBPDDelay: uint16(DefaultConfig().ReceiverLatency.Milliseconds()),
+			SendTSBPDDelay: uint16(DefaultConfig().PeerLatency.Milliseconds()),
+		},
+		HasGroup: group != nil,
+		SRTGroup: group,
+	}
+	conclusionResp.PeerIP.FromNetAddr(p.Header().Addr)
+	p.MarshalCIF(conclusionResp)
+
+	var outbuf bytes.Buffer
+
+	require.NoError(t, p.Marshal(&outbuf))
+
+	return outbuf.Bytes()
+}
+
+func TestDialMalformedHandshake(t *testing.T) {
+	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+		// Build a valid conclusion with a group extension and corrupt the
+		// extension's declared length, exactly the malformed handshake that
+		// libsrt peers produce when an extension follows the group
+		// extension. The dial must fail with the parse error instead of
+		// silently timing out.
+		data := conclusionResponse(t, p, recvcif, &packet.CIFGroupExtension{
+			GroupId:    packet.SRTGROUP_MASK,
+			GroupType:  packet.GroupTypeBroadcast,
+			LinkWeight: 1,
+		})
+
+		// Patch the length word of the GROUP extension (type 0x0008) from 2 to
+		// 3 words. The data returned by conclusionResponse is the full UDP
+		// packet, so the CIF payload starts after the SRT packet header.
+		for i := SRT_HEADER_SIZE + 48; i+4 <= len(data); {
+			extType := int(binary.BigEndian.Uint16(data[i:]))
+			extLen := int(binary.BigEndian.Uint16(data[i+2:]))
+
+			if extType == 8 {
+				data[i+2] = 0
+				data[i+3] = 3
+				break
+			}
+
+			i += 4 + extLen*4
+		}
+
+		return data
+	})
+
+	_, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	require.ErrorContains(t, err, "failed parsing handshake")
+
+	require.NoError(t, <-serverDone)
+}
+
+func TestDialGroupPeerNotInGroup(t *testing.T) {
+	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+		return conclusionResponse(t, p, recvcif, nil)
+	})
+
+	config := DefaultConfig()
+
+	group, err := NewGroup(GroupTypeBroadcast, config)
+	require.NoError(t, err)
+	defer group.Close()
+
+	err = group.Connect("srt", "127.0.0.1:6003", 1)
+	require.EqualError(t, err, "peer is not part of a bonding group")
+
+	require.NoError(t, <-serverDone)
+}
+
+func TestDialGroupInvalidGroupId(t *testing.T) {
+	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+		return conclusionResponse(t, p, recvcif, &packet.CIFGroupExtension{
+			GroupId:    0x12345678, // missing the SRTGROUP_MASK bit
+			GroupType:  packet.GroupTypeBroadcast,
+			LinkWeight: 1,
+		})
+	})
+
+	config := DefaultConfig()
+
+	group, err := NewGroup(GroupTypeBroadcast, config)
+	require.NoError(t, err)
+	defer group.Close()
+
+	err = group.Connect("srt", "127.0.0.1:6003", 1)
+	require.EqualError(t, err, "peer sent an invalid group id")
+
+	require.NoError(t, <-serverDone)
 }

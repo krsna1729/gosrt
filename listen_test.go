@@ -44,6 +44,39 @@ func TestListenerControl(t *testing.T) {
 	require.True(t, called, "ListenerControl callback was not invoked")
 }
 
+func TestListenAcceptEncryptedWithoutPassphrase(t *testing.T) {
+	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	require.NoError(t, err)
+
+	listenWg := sync.WaitGroup{}
+	listenWg.Add(1)
+
+	go func(ln Listener) {
+		listenWg.Done()
+
+		req, err := ln.Accept2()
+		require.NoError(t, err)
+
+		require.True(t, req.IsEncrypted())
+
+		// Accepting an encrypted request without providing a passphrase
+		// must reject it with REJ_BADSECRET instead of silently accepting.
+		_, err = req.Accept()
+		require.EqualError(t, err, "passphrase is missing")
+	}(ln)
+
+	listenWg.Wait()
+
+	config := DefaultConfig()
+	config.Passphrase = "zaboofzaboof"
+
+	_, err = Dial("srt", "127.0.0.1:6003", config)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "rejected")
+
+	ln.Close()
+}
+
 func TestListen(t *testing.T) {
 	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
 	require.NoError(t, err)

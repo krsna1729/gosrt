@@ -729,11 +729,17 @@ func (c *CIFHandshake) Unmarshal(data []byte) error {
 
 	pivot := data[48:]
 
-	for {
+	for len(pivot) >= 4 {
 		extensionType := CtrlSubType(binary.BigEndian.Uint16(pivot[0:]))
 		extensionLength := int(binary.BigEndian.Uint16(pivot[2:])) * 4
 
 		pivot = pivot[4:]
+
+		if extensionLength == 0 {
+			// A zero-length extension carries no data and would otherwise
+			// make the walker advance by zero and loop forever.
+			break
+		}
 
 		if len(pivot) < extensionLength {
 			return fmt.Errorf("invalid extension length of %d bytes (%s)", extensionLength, extensionType.String())

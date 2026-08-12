@@ -387,7 +387,15 @@ func (dl *dialer) handleHandshake(p packet.Packet) {
 	dl.log("handshake:recv:cif", func() string { return cif.String() })
 
 	if err != nil {
+		// A handshake that cannot be parsed is fatal: fail the dial with
+		// the parse error instead of silently timing out.
 		dl.log("handshake:recv:error", func() string { return err.Error() })
+
+		dl.connChan <- connResponse{
+			conn: nil,
+			err:  fmt.Errorf("failed parsing handshake: %w", err),
+		}
+
 		return
 	}
 
