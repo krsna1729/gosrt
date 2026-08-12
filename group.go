@@ -121,6 +121,11 @@ type Group struct {
 	links       []*groupLink
 	linksByConn map[*srtConn]*groupLink // O(1) lookup for the per-packet hooks
 
+	// scratch is a reusable result buffer for activeLinksLocked. The group
+	// lock is held by the only caller (Write) for the whole call, so the
+	// slice is never aliased between calls.
+	scratch []*groupLink
+
 	shutdownOnce sync.Once
 	closed       bool
 
@@ -677,9 +682,12 @@ func (g *Group) getTimestamp() uint64 {
 	return uint64(time.Since(g.start).Microseconds())
 }
 
-// activeLinksLocked returns the links that are currently sending data.
+// activeLinksLocked returns the links that are currently sending data. The
+// returned slice is a scratch buffer of the group and is only valid until the
+// next call to activeLinksLocked. Write is the only caller and discards the
+// result before it calls the function again, so the reuse is safe.
 func (g *Group) activeLinksLocked() []*groupLink {
-	active := make([]*groupLink, 0, len(g.links))
+	active := g.scratch[:0]
 
 	for _, l := range g.links {
 		if l.closed {
@@ -692,6 +700,8 @@ func (g *Group) activeLinksLocked() []*groupLink {
 			active = append(active, l)
 		}
 	}
+
+	g.scratch = active
 
 	return active
 }
@@ -772,8 +782,14 @@ func (g *Group) Write(b []byte) (int, error) {
 		}
 
 		full := 0
+		handedOff := false
 
-		for _, l := range links {
+		// Clone the packet for all links but the first one. The clones are
+		// created while the original is still exclusively owned by this
+		// Write call: the link senders mutate the packets they receive
+		// (congestion push), so nothing may touch the original after it has
+		// been handed to the first link.
+		for _, l := range links[1:] {
 			select {
 			case <-l.conn.ctx.Done():
 				full++
@@ -783,7 +799,24 @@ func (g *Group) Write(b []byte) (int, error) {
 			}
 		}
 
-		p.Decommission()
+		// Hand the original packet to the first link instead of cloning it,
+		// saving one allocation and one payload copy per packet. The link
+		// owns the packet afterwards; it is only decommissioned when no
+		// link accepted it.
+		if len(links) > 0 {
+			select {
+			case <-links[0].conn.ctx.Done():
+				full++
+			case links[0].conn.writeQueue <- p:
+				handedOff = true
+			default:
+				full++
+			}
+		}
+
+		if !handedOff {
+			p.Decommission()
+		}
 
 		if g.gt == GroupTypeBackup {
 			// Drop the oldest packets when the send buffer exceeds the flow
