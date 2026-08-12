@@ -17,12 +17,12 @@ import (
 )
 
 func TestListenReuse(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	ln.Close()
 
-	ln, err = Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err = Listen("srt", ln.Addr().String(), DefaultConfig())
 	require.NoError(t, err)
 
 	ln.Close()
@@ -37,7 +37,7 @@ func TestListenerControl(t *testing.T) {
 		return nil
 	}
 
-	ln, err := Listen("srt", "127.0.0.1:6003", config)
+	ln, err := Listen("srt", "127.0.0.1:0", config)
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -45,7 +45,7 @@ func TestListenerControl(t *testing.T) {
 }
 
 func TestListenAcceptEncryptedWithoutPassphrase(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -70,7 +70,7 @@ func TestListenAcceptEncryptedWithoutPassphrase(t *testing.T) {
 	config := DefaultConfig()
 	config.Passphrase = "zaboofzaboof"
 
-	_, err = Dial("srt", "127.0.0.1:6003", config)
+	_, err = Dial("srt", ln.Addr().String(), config)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "rejected")
 
@@ -78,7 +78,7 @@ func TestListenAcceptEncryptedWithoutPassphrase(t *testing.T) {
 }
 
 func TestListen(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -107,7 +107,7 @@ func TestListen(t *testing.T) {
 	config := DefaultConfig()
 	config.StreamId = "foobar"
 
-	conn, err := Dial("srt", "127.0.0.1:6003", config)
+	conn, err := Dial("srt", ln.Addr().String(), config)
 	require.NoError(t, err)
 
 	err = conn.Close()
@@ -117,7 +117,7 @@ func TestListen(t *testing.T) {
 }
 
 func TestListenCrypt(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -151,7 +151,7 @@ func TestListenCrypt(t *testing.T) {
 	config.StreamId = "foobar"
 	config.Passphrase = "zaboofzaboof"
 
-	conn, err := Dial("srt", "127.0.0.1:6003", config)
+	conn, err := Dial("srt", ln.Addr().String(), config)
 	require.NoError(t, err)
 
 	err = conn.Close()
@@ -159,7 +159,7 @@ func TestListenCrypt(t *testing.T) {
 
 	config.Passphrase = "raboofraboof"
 
-	_, err = Dial("srt", "127.0.0.1:6003", config)
+	_, err = Dial("srt", ln.Addr().String(), config)
 	require.Error(t, err)
 
 	ln.Close()
@@ -172,7 +172,7 @@ func TestListenHSV4(t *testing.T) {
 		Control: ListenControl(DefaultConfig()),
 	}
 
-	lp, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:6003")
+	lp, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	pc := lp.(*net.UDPConn)
@@ -206,7 +206,7 @@ func TestListenHSV4(t *testing.T) {
 	listenWg.Wait()
 
 	go func() {
-		conn, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+		conn, err := Dial("srt", lp.LocalAddr().String(), DefaultConfig())
 		if err != nil {
 			if err == ErrClientClosed {
 				return
@@ -306,7 +306,7 @@ func TestListenHSV5(t *testing.T) {
 		Control: ListenControl(DefaultConfig()),
 	}
 
-	lp, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:6003")
+	lp, err := lc.ListenPacket(context.Background(), "udp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	pc := lp.(*net.UDPConn)
@@ -342,7 +342,7 @@ func TestListenHSV5(t *testing.T) {
 	go func() {
 		config := DefaultConfig()
 		config.StreamId = "foobar"
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", lp.LocalAddr().String(), config)
 		if err != nil {
 			if err == ErrClientClosed {
 				return
@@ -437,7 +437,7 @@ func TestListenHSV5(t *testing.T) {
 
 func TestListenAsync(t *testing.T) {
 	const parallelCount = 2
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 	var (
 		// All streams are pending
@@ -474,7 +474,7 @@ func TestListenAsync(t *testing.T) {
 		go func(streamId string) {
 			config := DefaultConfig()
 			config.StreamId = streamId
-			conn, err := Dial("srt", "127.0.0.1:6003", config)
+			conn, err := Dial("srt", ln.Addr().String(), config)
 			require.NoError(t, err)
 			connectedWg.Done()
 			conn.Close()
@@ -488,7 +488,7 @@ func TestListenAsync(t *testing.T) {
 }
 
 func TestListenHSV5MissingExtension(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenDone := make(chan struct{})
@@ -506,7 +506,7 @@ func TestListenHSV5MissingExtension(t *testing.T) {
 		}
 	}()
 
-	conn, err := net.Dial("udp", "127.0.0.1:6003")
+	conn, err := net.Dial("udp", ln.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
 
@@ -582,7 +582,7 @@ func TestListenHSV5MissingExtension(t *testing.T) {
 }
 
 func TestListenParallelRequests(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenDone := make(chan struct{})
@@ -625,7 +625,7 @@ func TestListenParallelRequests(t *testing.T) {
 			config := DefaultConfig()
 			config.StreamId = "foobar"
 
-			conn, err := Dial("srt", "127.0.0.1:6003", config)
+			conn, err := Dial("srt", ln.Addr().String(), config)
 			require.NoError(t, err)
 
 			err = conn.Close()
@@ -640,7 +640,7 @@ func TestListenParallelRequests(t *testing.T) {
 }
 
 func TestListenDiscardRepeatedHandshakes(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	singleReqReceived := make(chan struct{})
@@ -665,7 +665,7 @@ func TestListenDiscardRepeatedHandshakes(t *testing.T) {
 	}()
 
 	for range 4 {
-		conn, err := net.Dial("udp", "127.0.0.1:6003")
+		conn, err := net.Dial("udp", ln.Addr().String())
 		require.NoError(t, err)
 		defer conn.Close()
 
@@ -748,7 +748,7 @@ func TestListenDiscardRepeatedHandshakes(t *testing.T) {
 }
 
 func TestListenMultipleIPs(t *testing.T) {
-	ln, err := Listen("srt", "0.0.0.0:6003", DefaultConfig())
+	ln, err := Listen("srt", "0.0.0.0:0", DefaultConfig())
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -772,7 +772,9 @@ func TestListenMultipleIPs(t *testing.T) {
 	// Dial to the secondary loopback address. Without the fix the listener
 	// responds from 127.0.0.1 (kernel routing choice), which the client's
 	// connected socket discards, causing Dial to time out.
-	clientConn, err := Dial("srt", "127.0.0.2:6003", DefaultConfig())
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
+	clientConn, err := Dial("srt", net.JoinHostPort("127.0.0.2", port), DefaultConfig())
 	require.NoError(t, err)
 	defer clientConn.Close()
 
@@ -780,7 +782,7 @@ func TestListenMultipleIPs(t *testing.T) {
 }
 
 func TestListenAcceptAndDiscardRepeatedHandshakes(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	singleReqAccepted := make(chan struct{})
@@ -807,7 +809,7 @@ func TestListenAcceptAndDiscardRepeatedHandshakes(t *testing.T) {
 		}
 	}()
 
-	conn, err := net.Dial("udp", "127.0.0.1:6003")
+	conn, err := net.Dial("udp", ln.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
 

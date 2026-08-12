@@ -17,7 +17,7 @@ func TestPubSub(t *testing.T) {
 	config := DefaultConfig()
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
+		Addr:   "127.0.0.1:0",
 		Config: &config,
 		HandleConnect: func(req ConnRequest) ConnType {
 			streamid := req.StreamId()
@@ -44,6 +44,7 @@ func TestPubSub(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	go func() {
 		err := server.Serve()
@@ -66,7 +67,7 @@ func TestPubSub(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamId = "subscribe"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -96,7 +97,7 @@ func TestPubSub(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamId = "subscribe"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -130,7 +131,7 @@ func TestPubSub(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamId = "publish"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}

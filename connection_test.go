@@ -22,7 +22,7 @@ func TestEncryption(t *testing.T) {
 	config.EnforcedEncryption = true
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
+		Addr:   "127.0.0.1:0",
 		Config: &config,
 		HandleConnect: func(req ConnRequest) ConnType {
 			if req.IsEncrypted() {
@@ -55,6 +55,7 @@ func TestEncryption(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	defer server.Shutdown()
 
@@ -72,7 +73,7 @@ func TestEncryption(t *testing.T) {
 		config.StreamId = "subscribe"
 		config.Passphrase = "barfoobarfoo"
 
-		_, err := Dial("srt", "127.0.0.1:6003", config)
+		_, err := Dial("srt", addr, config)
 		require.Error(t, err)
 	}
 	// Test transmitting an encrypted message
@@ -89,7 +90,7 @@ func TestEncryption(t *testing.T) {
 		config.StreamId = "subscribe"
 		config.Passphrase = "foobarfoobar"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -124,7 +125,7 @@ func TestEncryption(t *testing.T) {
 		config.StreamId = "publish"
 		config.Passphrase = "foobarfoobar"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -159,7 +160,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 	config.EnforcedEncryption = true
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
+		Addr:   "127.0.0.1:0",
 		Config: &config,
 		HandleConnect: func(req ConnRequest) ConnType {
 			if req.IsEncrypted() {
@@ -192,6 +193,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	defer server.Shutdown()
 
@@ -209,7 +211,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 		config.StreamId = "subscribe"
 		config.Passphrase = "barfoobarfoo"
 
-		_, err := Dial("srt", "127.0.0.1:6003", config)
+		_, err := Dial("srt", addr, config)
 		require.Error(t, err)
 	}
 
@@ -227,7 +229,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 		config.StreamId = "subscribe"
 		config.Passphrase = "foobarfoobar"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -262,7 +264,7 @@ func TestEncryptionRetransmit(t *testing.T) {
 		config.StreamId = "publish"
 		config.Passphrase = "foobarfoobar"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -318,7 +320,7 @@ func TestEncryptionKeySwap(t *testing.T) {
 	config.EnforcedEncryption = true
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
+		Addr:   "127.0.0.1:0",
 		Config: &config,
 		HandleConnect: func(req ConnRequest) ConnType {
 			if req.IsEncrypted() {
@@ -351,6 +353,7 @@ func TestEncryptionKeySwap(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	defer server.Shutdown()
 
@@ -376,7 +379,7 @@ func TestEncryptionKeySwap(t *testing.T) {
 		config.StreamId = "subscribe"
 		config.Passphrase = "foobarfoobar"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -414,7 +417,7 @@ func TestEncryptionKeySwap(t *testing.T) {
 		config.KMPreAnnounce = 10
 		config.KMRefreshRate = 30
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -449,7 +452,7 @@ func TestStats(t *testing.T) {
 	config := DefaultConfig()
 
 	server := Server{
-		Addr:   "127.0.0.1:6003",
+		Addr:   "127.0.0.1:0",
 		Config: &config,
 		HandleConnect: func(req ConnRequest) ConnType {
 			streamid := req.StreamId()
@@ -476,6 +479,7 @@ func TestStats(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	defer server.Shutdown()
 
@@ -501,7 +505,7 @@ func TestStats(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamId = "subscribe"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -537,7 +541,7 @@ func TestStats(t *testing.T) {
 		config := DefaultConfig()
 		config.StreamId = "publish"
 
-		conn, err := Dial("srt", "127.0.0.1:6003", config)
+		conn, err := Dial("srt", addr, config)
 		if !assert.NoError(t, err) {
 			panic(err.Error())
 		}
@@ -572,7 +576,7 @@ func TestStats(t *testing.T) {
 
 // newHookTestConn builds a connection without any network socket in order to
 // test the internal hooks. The default onSend hook swallows all packets.
-func newHookTestConn(t *testing.T, config srtConnConfig) *srtConn {
+func newHookTestConn(t testing.TB, config srtConnConfig) *srtConn {
 	t.Helper()
 
 	if config.config.PayloadSize == 0 {
@@ -612,6 +616,15 @@ func newHookTestConn(t *testing.T, config srtConnConfig) *srtConn {
 	t.Cleanup(c.close)
 
 	return c
+}
+
+// setOnSend replaces the onSend hook of a running test connection. The
+// connection's sender goroutine reads onSend under the onSend lock (see
+// srtConn.pop), so direct field assignment would race with it.
+func setOnSend(c *srtConn, onSend func(packet.Packet)) {
+	c.onSendLock.Lock()
+	c.onSend = onSend
+	c.onSendLock.Unlock()
 }
 
 func TestDeliverToHook(t *testing.T) {

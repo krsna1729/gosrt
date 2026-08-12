@@ -2,7 +2,7 @@ package srt
 
 import (
 	"bytes"
-"context"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -17,7 +17,7 @@ import (
 )
 
 func TestDialReject(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -40,7 +40,7 @@ func TestDialReject(t *testing.T) {
 
 	listenWg.Wait()
 
-	conn, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	conn, err := Dial("srt", ln.Addr().String(), DefaultConfig())
 	require.Error(t, err)
 	require.Nil(t, conn)
 
@@ -48,7 +48,7 @@ func TestDialReject(t *testing.T) {
 }
 
 func TestDialOK(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -71,7 +71,7 @@ func TestDialOK(t *testing.T) {
 
 	listenWg.Wait()
 
-	conn, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	conn, err := Dial("srt", ln.Addr().String(), DefaultConfig())
 	require.NoError(t, err)
 
 	err = conn.Close()
@@ -120,7 +120,7 @@ func TestDialWithContextCancel(t *testing.T) {
 }
 
 func TestDialV4(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -145,7 +145,7 @@ func TestDialV4(t *testing.T) {
 
 	start := time.Now()
 
-	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:6003")
+	raddr, err := net.ResolveUDPAddr("udp", ln.Addr().String())
 	require.NoError(t, err)
 
 	pc, err := net.DialUDP("udp", nil, raddr)
@@ -266,7 +266,7 @@ func TestDialV4(t *testing.T) {
 }
 
 func TestDialV5(t *testing.T) {
-	ln, err := Listen("srt", "127.0.0.1:6003", DefaultConfig())
+	ln, err := Listen("srt", "127.0.0.1:0", DefaultConfig())
 	require.NoError(t, err)
 
 	listenWg := sync.WaitGroup{}
@@ -291,7 +291,7 @@ func TestDialV5(t *testing.T) {
 
 	start := time.Now()
 
-	raddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:6003")
+	raddr, err := net.ResolveUDPAddr("udp", ln.Addr().String())
 	require.NoError(t, err)
 
 	pc, err := net.DialUDP("udp", nil, raddr)
@@ -440,7 +440,7 @@ func TestDialV5(t *testing.T) {
 // test support for servers based on libsrt <= 1.3.0
 // in which DestinationSocketId of the CONCLUSION response is always zero.
 func TestDialV5Pre130(t *testing.T) {
-	ln, err := net.ListenPacket("udp", "127.0.0.1:6003")
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -557,7 +557,7 @@ func TestDialV5Pre130(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.ConnectionTimeout = 3 * time.Second
-	conn, err := Dial("srt", "127.0.0.1:6003", cfg)
+	conn, err := Dial("srt", ln.LocalAddr().String(), cfg)
 	require.NoError(t, err)
 	conn.Close()
 
@@ -565,7 +565,7 @@ func TestDialV5Pre130(t *testing.T) {
 }
 
 func TestDialV5MissingExtension(t *testing.T) {
-	ln, err := net.ListenPacket("udp", "127.0.0.1:6003")
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer ln.Close()
 
@@ -637,18 +637,19 @@ func TestDialV5MissingExtension(t *testing.T) {
 		ln.WriteTo(outbuf.Bytes(), p.Header().Addr)
 	}()
 
-	_, err = Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	_, err = Dial("srt", ln.LocalAddr().String(), DefaultConfig())
 	require.EqualError(t, err, "missing handshake extension")
 }
 
-// fakeSRTServer runs a minimal SRT v5 listener peer on 127.0.0.1:6003: it
+// fakeSRTServer runs a minimal SRT v5 listener peer on an ephemeral port: it
 // answers the induction with a valid response and answers the conclusion
-// request with the bytes returned by answer. Any error encountered by the
-// server is sent to the returned channel.
-func fakeSRTServer(t *testing.T, answer func(p packet.Packet, cif *packet.CIFHandshake) []byte) <-chan error {
+// request with the bytes returned by answer. It returns the address of the
+// listener. Any error encountered by the server is sent to the returned
+// channel.
+func fakeSRTServer(t *testing.T, answer func(p packet.Packet, cif *packet.CIFHandshake) []byte) (string, <-chan error) {
 	t.Helper()
 
-	ln, err := net.ListenPacket("udp", "127.0.0.1:6003")
+	ln, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	serverDone := make(chan error, 1)
@@ -750,7 +751,7 @@ func fakeSRTServer(t *testing.T, answer func(p packet.Packet, cif *packet.CIFHan
 		serverDone <- nil
 	}()
 
-	return serverDone
+	return ln.LocalAddr().String(), serverDone
 }
 
 // conclusionResponse marshals a valid v5 conclusion response to the request
@@ -804,7 +805,7 @@ func conclusionResponse(t *testing.T, p packet.Packet, recvcif *packet.CIFHandsh
 }
 
 func TestDialMalformedHandshake(t *testing.T) {
-	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+	addr, serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
 		// Build a valid conclusion with a group extension and corrupt the
 		// extension's declared length, exactly the malformed handshake that
 		// libsrt peers produce when an extension follows the group
@@ -835,14 +836,14 @@ func TestDialMalformedHandshake(t *testing.T) {
 		return data
 	})
 
-	_, err := Dial("srt", "127.0.0.1:6003", DefaultConfig())
+	_, err := Dial("srt", addr, DefaultConfig())
 	require.ErrorContains(t, err, "failed parsing handshake")
 
 	require.NoError(t, <-serverDone)
 }
 
 func TestDialGroupPeerNotInGroup(t *testing.T) {
-	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+	addr, serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
 		return conclusionResponse(t, p, recvcif, nil)
 	})
 
@@ -852,14 +853,14 @@ func TestDialGroupPeerNotInGroup(t *testing.T) {
 	require.NoError(t, err)
 	defer group.Close()
 
-	err = group.Connect("srt", "127.0.0.1:6003", 1)
+	err = group.Connect("srt", addr, 1)
 	require.EqualError(t, err, "peer is not part of a bonding group")
 
 	require.NoError(t, <-serverDone)
 }
 
 func TestDialGroupInvalidGroupId(t *testing.T) {
-	serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
+	addr, serverDone := fakeSRTServer(t, func(p packet.Packet, recvcif *packet.CIFHandshake) []byte {
 		return conclusionResponse(t, p, recvcif, &packet.CIFGroupExtension{
 			GroupId:    0x12345678, // missing the SRTGROUP_MASK bit
 			GroupType:  packet.GroupTypeBroadcast,
@@ -873,7 +874,7 @@ func TestDialGroupInvalidGroupId(t *testing.T) {
 	require.NoError(t, err)
 	defer group.Close()
 
-	err = group.Connect("srt", "127.0.0.1:6003", 1)
+	err = group.Connect("srt", addr, 1)
 	require.EqualError(t, err, "peer sent an invalid group id")
 
 	require.NoError(t, <-serverDone)

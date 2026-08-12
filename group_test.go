@@ -13,7 +13,7 @@ import (
 
 // newGroupLinkConn builds a connection without any network socket that acts as
 // a link of the given group.
-func newGroupLinkConn(t *testing.T, g *Group, weight uint16) *srtConn {
+func newGroupLinkConn(t testing.TB, g *Group, weight uint16) *srtConn {
 	t.Helper()
 
 	var c *srtConn
@@ -33,7 +33,7 @@ func newGroupLinkConn(t *testing.T, g *Group, weight uint16) *srtConn {
 
 // collectSent returns an onSend hook that collects the payloads of all sent
 // data packets in order.
-func collectSent(t *testing.T, ch chan<- packet.Packet) func(p packet.Packet) {
+func collectSent(t testing.TB, ch chan<- packet.Packet) func(p packet.Packet) {
 	return func(p packet.Packet) {
 		if !p.Header().IsControlPacket {
 			select {
@@ -65,10 +65,10 @@ func TestGroupBroadcastWrite(t *testing.T) {
 	sent2 := make(chan packet.Packet, 16)
 
 	c1 := newGroupLinkConn(t, g, 1)
-	c1.onSend = collectSent(t, sent1)
+	setOnSend(c1, collectSent(t, sent1))
 
 	c2 := newGroupLinkConn(t, g, 1)
-	c2.onSend = collectSent(t, sent2)
+	setOnSend(c2, collectSent(t, sent2))
 
 	require.NoError(t, g.addLink(c1, 1))
 	require.NoError(t, g.addLink(c2, 1))
@@ -153,10 +153,10 @@ func TestGroupBackupFailover(t *testing.T) {
 	sent2 := make(chan packet.Packet, 64)
 
 	c1 := newGroupLinkConn(t, g, 1)
-	c1.onSend = collectSent(t, sent1)
+	setOnSend(c1, collectSent(t, sent1))
 
 	c2 := newGroupLinkConn(t, g, 2)
-	c2.onSend = collectSent(t, sent2)
+	setOnSend(c2, collectSent(t, sent2))
 
 	require.NoError(t, g.addLink(c1, 1))
 	require.NoError(t, g.addLink(c2, 2))
@@ -445,10 +445,10 @@ func TestGroupBackupRecoveredLowerWeightStaysIdle(t *testing.T) {
 	sent2 := make(chan packet.Packet, 8)
 
 	c1 := newGroupLinkConn(t, g, 1)
-	c1.onSend = collectSent(t, sent1)
+	setOnSend(c1, collectSent(t, sent1))
 
 	c2 := newGroupLinkConn(t, g, 2)
-	c2.onSend = collectSent(t, sent2)
+	setOnSend(c2, collectSent(t, sent2))
 
 	require.NoError(t, g.addLink(c1, 1))
 	require.NoError(t, g.addLink(c2, 2))

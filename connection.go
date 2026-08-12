@@ -779,12 +779,31 @@ func (c *srtConn) handlePacket(p packet.Packet) {
 				c.statistics.pktRecvUndecrypt++
 				c.statistics.byteRecvUndecrypt += p.Len()
 				c.statisticsLock.Unlock()
+				c.cryptoLock.Unlock()
+
+				// Undecryptable packet: drop it. Delivering ciphertext
+				// would corrupt the stream. The loss detection will ask
+				// for a retransmission; by then the key swap will have
+				// completed on our side and the retransmit will decrypt.
+				c.log("data:recv:undecryptable", func() string {
+					return fmt.Sprintf("dropped undecryptable packet %d", header.PacketSequenceNumber.Val())
+				})
+				p.Decommission()
+				return
 			}
 		} else {
 			c.statisticsLock.Lock()
 			c.statistics.pktRecvUndecrypt++
 			c.statistics.byteRecvUndecrypt += p.Len()
 			c.statisticsLock.Unlock()
+			c.cryptoLock.Unlock()
+
+			// Unencrypted data packet on an encrypted connection — invalid.
+			c.log("data:recv:undecryptable", func() string {
+				return fmt.Sprintf("dropped unencrypted packet %d on encrypted connection", header.PacketSequenceNumber.Val())
+			})
+			p.Decommission()
+			return
 		}
 	}
 	c.cryptoLock.Unlock()

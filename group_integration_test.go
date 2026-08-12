@@ -195,6 +195,23 @@ func TestGroupBackupFailoverIntegration(t *testing.T) {
 		return g.links[1].state == GroupLinkRunning
 	}, time.Second, time.Millisecond)
 
+	// Wait for the mirror group to have completed its own failover before
+	// sending the next packet. The mirror's receiver must be synced to the
+	// group's sequence position so that it can deliver the packet in order.
+	if mg, ok := mirror.(*Group); ok {
+		require.Eventually(t, func() bool {
+			mg.lock.RLock()
+			defer mg.lock.RUnlock()
+
+			if len(mg.links) < 2 {
+				return false
+			}
+			// The running link (weight 2 after failover) means the mirror
+			// has finished its own failover.
+			return mg.links[1].state == GroupLinkRunning
+		}, time.Second, 5*time.Millisecond)
+	}
+
 	_, err = g.Write([]byte("two"))
 	require.NoError(t, err)
 

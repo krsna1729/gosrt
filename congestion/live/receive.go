@@ -374,7 +374,7 @@ func (r *receiver) Tick(now uint64) {
 	for e := r.packetList.Front(); e != nil; e = e.Next() {
 		p := e.Value.(packet.Packet)
 
-		if p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) && p.Header().PktTsbpdTime <= now {
+		if (p.Header().PacketSequenceNumber.Lte(r.lastACKSequenceNumber) || p.Header().PacketSequenceNumber.Equals(r.lastDeliveredSequenceNumber.Inc())) && p.Header().PktTsbpdTime <= now {
 			r.statistics.PktBuf--
 			r.statistics.ByteBuf -= p.Len()
 
@@ -427,6 +427,20 @@ func (r *receiver) SetSequenceNumber(sequenceNumber circular.Number) {
 	r.maxSeenSequenceNumber = sequenceNumber.Dec()
 	r.lastACKSequenceNumber = sequenceNumber.Dec()
 	r.lastDeliveredSequenceNumber = sequenceNumber.Dec()
+
+	// Clear any packets that were queued before the sync. They were
+	// positioned against the old sequence space of this link. Packets
+	// that are ahead of the new position would create gaps in the new
+	// space that cannot be filled, because those gaps were already
+	// delivered by another link. The group will NAK any truly missing
+	// packets and the peer will retransmit them on the new running link.
+	for e := r.packetList.Front(); e != nil; {
+		p := e.Value.(packet.Packet)
+		next := e.Next()
+		p.Decommission()
+		r.packetList.Remove(e)
+		e = next
+	}
 
 	r.probeTime = time.Time{}
 	r.nPackets = 0

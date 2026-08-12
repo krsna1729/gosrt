@@ -8,7 +8,7 @@ import (
 
 func TestServer(t *testing.T) {
 	server := Server{
-		Addr: "127.0.0.1:6003",
+		Addr: "127.0.0.1:0",
 		HandleConnect: func(req ConnRequest) ConnType {
 			streamid := req.StreamId()
 
@@ -24,6 +24,7 @@ func TestServer(t *testing.T) {
 
 	err := server.Listen()
 	require.NoError(t, err)
+	addr := server.ln.Addr().String()
 
 	defer server.Shutdown()
 
@@ -38,7 +39,7 @@ func TestServer(t *testing.T) {
 	config := DefaultConfig()
 	config.StreamId = "publish"
 
-	conn, err := Dial("srt", "127.0.0.1:6003", config)
+	conn, err := Dial("srt", addr, config)
 	require.NoError(t, err)
 
 	err = conn.Close()
@@ -47,7 +48,7 @@ func TestServer(t *testing.T) {
 	config = DefaultConfig()
 	config.StreamId = "subscribe"
 
-	conn, err = Dial("srt", "127.0.0.1:6003", config)
+	conn, err = Dial("srt", addr, config)
 	require.NoError(t, err)
 
 	err = conn.Close()
@@ -56,6 +57,6 @@ func TestServer(t *testing.T) {
 	config = DefaultConfig()
 	config.StreamId = "nothing"
 
-	_, err = Dial("srt", "127.0.0.1:6003", config)
+	_, err = Dial("srt", addr, config)
 	require.Error(t, err)
 }
