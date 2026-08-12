@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -176,6 +177,19 @@ type Config struct {
 	// but before the socket is bound. Same signature as net.ListenConfig.Control.
 	ListenerControl func(network, address string, c syscall.RawConn) error
 
+	// GroupType specifies the type of bonding group when dialing as a caller.
+	// When non-zero the Dial functions create a group instead of a single
+	// connection. Additional links from the links URL parameter are connected
+	// via repeated g.Connect calls.
+	// SRTO_GROUPTYPE
+	GroupType GroupType
+
+	// GroupLinks holds additional link addresses for a bonding group caller.
+	// Populated from the comma-separated "links" URL parameter. When GroupType
+	// is non-zero and this slice is empty a second link to the main address
+	// is added automatically.
+	GroupLinks []string
+
 	// if a new IP starts sending data on an existing socket id, allow it
 	AllowPeerIpChange bool
 }
@@ -285,6 +299,21 @@ func (c *Config) UnmarshalQuery(query string) error {
 	if s := v.Get("fc"); len(s) != 0 {
 		if d, err := strconv.ParseUint(s, 10, 32); err == nil {
 			c.FC = uint32(d)
+		}
+	}
+
+	if s := v.Get("group"); len(s) != 0 {
+		switch s {
+		case "backup":
+			c.GroupType = GroupTypeBackup
+		case "broadcast":
+			c.GroupType = GroupTypeBroadcast
+		}
+	}
+
+	if s := v.Get("links"); len(s) != 0 {
+		for _, addr := range strings.Split(s, ",") {
+			c.GroupLinks = append(c.GroupLinks, strings.TrimSpace(addr))
 		}
 	}
 
