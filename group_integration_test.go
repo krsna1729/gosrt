@@ -2,6 +2,7 @@ package srt
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -224,137 +225,147 @@ func TestGroupBackupFailoverIntegration(t *testing.T) {
 
 // TestGroupEncrypted verifies that a bonding group encrypts the data of all
 // its links and that the mirror group decrypts and de-duplicates it.
+// TestGroupEncrypted verifies that a bonding group encrypts the data of all
+// its links and that the mirror group decrypts and de-duplicates it. It runs
+// for all AES key sizes (SRT KM KLen 16, 24, and 32).
 func TestGroupEncrypted(t *testing.T) {
-	passphrase := "foobarfoobar"
-	channel := NewPubSub(PubSubConfig{})
+	for _, pbkeylen := range []int{16, 24, 32} {
+		t.Run(fmt.Sprintf("PBKeylen %d", pbkeylen), func(t *testing.T) {
+			passphrase := "foobarfoobar"
+			channel := NewPubSub(PubSubConfig{})
 
-	config := DefaultConfig()
-	config.EnforcedEncryption = true
-	config.GroupConnect = true
+			config := DefaultConfig()
+			config.EnforcedEncryption = true
+			config.GroupConnect = true
+			config.PBKeylen = pbkeylen
 
-	server := Server{
-		Addr:   "127.0.0.1:0",
-		Config: &config,
-		HandleConnect: func(req ConnRequest) ConnType {
-			if req.IsEncrypted() {
-				if err := req.SetPassphrase(passphrase); err != nil {
+			server := Server{
+				Addr:   "127.0.0.1:0",
+				Config: &config,
+				HandleConnect: func(req ConnRequest) ConnType {
+					if req.IsEncrypted() {
+						if err := req.SetPassphrase(passphrase); err != nil {
+							return REJECT
+						}
+					}
+
+					switch req.StreamId() {
+					case "publish":
+						return PUBLISH
+					case "subscribe":
+						return SUBSCRIBE
+					}
+
 					return REJECT
+				},
+				HandlePublish: func(conn Conn) {
+					channel.Publish(conn)
+
+					conn.Close()
+				},
+				HandleSubscribe: func(conn Conn) {
+					channel.Subscribe(conn)
+
+					conn.Close()
+				},
+			}
+
+			err := server.Listen()
+			require.NoError(t, err)
+
+			defer server.Shutdown()
+
+			go func() {
+				err := server.Serve()
+				if err == ErrServerClosed {
+					return
 				}
+				require.NoError(t, err)
+			}()
+
+			// A group with the wrong passphrase must not connect.
+			wrong := DefaultConfig()
+			wrong.StreamId = "publish"
+			wrong.Passphrase = "barfoobarfoo"
+
+			bad, err := NewGroup(GroupTypeBackup, wrong)
+			require.NoError(t, err)
+
+			defer bad.Close()
+
+			err = bad.Connect("srt", server.ln.Addr().String(), 1)
+			require.Error(t, err)
+
+			// The encrypted group connects both links and delivers the data.
+			// In broadcast mode the same encrypted packet arrives over both
+			// links and the mirror group must deliver it only once.
+			gconfig := DefaultConfig()
+			gconfig.StreamId = "publish"
+			gconfig.Passphrase = passphrase
+			gconfig.PBKeylen = pbkeylen
+
+			g, err := NewGroup(GroupTypeBroadcast, gconfig)
+			require.NoError(t, err)
+
+			defer g.Close()
+
+			require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 1))
+			require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 2))
+
+			readerConnected := make(chan struct{})
+			received := make(chan string, 16)
+
+			go func() {
+				config := DefaultConfig()
+				config.StreamId = "subscribe"
+				config.Passphrase = passphrase
+				config.PBKeylen = pbkeylen
+
+				conn, err := Dial("srt", server.ln.Addr().String(), config)
+				if !assert.NoError(t, err) {
+					panic(err.Error())
+				}
+
+				close(readerConnected)
+
+				buffer := make([]byte, 2048)
+
+				for {
+					n, err := conn.Read(buffer)
+					if n != 0 {
+						received <- string(buffer[:n])
+					}
+
+					if err != nil {
+						break
+					}
+				}
+
+				conn.Close()
+			}()
+
+			<-readerConnected
+
+			message := "Hello Group!"
+
+			_, err = g.Write([]byte(message))
+			require.NoError(t, err)
+
+			select {
+			case data := <-received:
+				require.Equal(t, message, data)
+			case <-time.After(10 * time.Second):
+				t.Fatal("timed out waiting for the encrypted message")
 			}
 
-			switch req.StreamId() {
-			case "publish":
-				return PUBLISH
-			case "subscribe":
-				return SUBSCRIBE
+			g.Close()
+
+			// Wait for the subscriber connection to wind down.
+			select {
+			case <-received:
+			case <-time.After(5 * time.Second):
 			}
-
-			return REJECT
-		},
-		HandlePublish: func(conn Conn) {
-			channel.Publish(conn)
-
-			conn.Close()
-		},
-		HandleSubscribe: func(conn Conn) {
-			channel.Subscribe(conn)
-
-			conn.Close()
-		},
-	}
-
-	err := server.Listen()
-	require.NoError(t, err)
-
-	defer server.Shutdown()
-
-	go func() {
-		err := server.Serve()
-		if err == ErrServerClosed {
-			return
-		}
-		require.NoError(t, err)
-	}()
-
-	// A group with the wrong passphrase must not connect.
-	wrong := DefaultConfig()
-	wrong.StreamId = "publish"
-	wrong.Passphrase = "barfoobarfoo"
-
-	bad, err := NewGroup(GroupTypeBackup, wrong)
-	require.NoError(t, err)
-
-	defer bad.Close()
-
-	err = bad.Connect("srt", server.ln.Addr().String(), 1)
-	require.Error(t, err)
-
-	// The encrypted group connects both links and delivers the data. In
-	// broadcast mode the same encrypted packet arrives over both links and
-	// the mirror group must deliver it only once.
-	gconfig := DefaultConfig()
-	gconfig.StreamId = "publish"
-	gconfig.Passphrase = passphrase
-
-	g, err := NewGroup(GroupTypeBroadcast, gconfig)
-	require.NoError(t, err)
-
-	defer g.Close()
-
-	require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 1))
-	require.NoError(t, g.Connect("srt", server.ln.Addr().String(), 2))
-
-	readerConnected := make(chan struct{})
-	received := make(chan string, 16)
-
-	go func() {
-		config := DefaultConfig()
-		config.StreamId = "subscribe"
-		config.Passphrase = passphrase
-
-		conn, err := Dial("srt", server.ln.Addr().String(), config)
-		if !assert.NoError(t, err) {
-			panic(err.Error())
-		}
-
-		close(readerConnected)
-
-		buffer := make([]byte, 2048)
-
-		for {
-			n, err := conn.Read(buffer)
-			if n != 0 {
-				received <- string(buffer[:n])
-			}
-
-			if err != nil {
-				break
-			}
-		}
-
-		conn.Close()
-	}()
-
-	<-readerConnected
-
-	message := "Hello Group!"
-
-	_, err = g.Write([]byte(message))
-	require.NoError(t, err)
-
-	select {
-	case data := <-received:
-		require.Equal(t, message, data)
-	case <-time.After(10 * time.Second):
-		t.Fatal("timed out waiting for the encrypted message")
-	}
-
-	g.Close()
-
-	// Wait for the subscriber connection to wind down.
-	select {
-	case <-received:
-	case <-time.After(5 * time.Second):
+		})
 	}
 }
 
